@@ -1,0 +1,311 @@
+use crate::object::{
+    self, Kind, MAX_OBJECT, MAX_OBJECTS, MAX_PACK, MAX_TOTAL, Object, Objects, Oid,
+};
+use anyhow::{Result, bail, ensure};
+use flate2::{Compression, Decompress, FlushDecompress, Status, write::ZlibEncoder};
+use std::{collections::HashMap, io::Write, sync::Arc};
+
+pub fn inflate(input: &[u8], size: usize) -> Result<(Vec<u8>, usize)> {
+    ensure!(size <= MAX_OBJECT + 128, "inflated object exceeds limit");
+    let mut output = vec![0; size + 1];
+    let mut z = Decompress::new(true);
+    let status = z.decompress(input, &mut output, FlushDecompress::Finish)?;
+    ensure!(
+        status == Status::StreamEnd,
+        "truncated or oversized zlib stream"
+    );
+    ensure!(z.total_out() as usize == size, "object size mismatch");
+    output.truncate(size);
+    Ok((output, z.total_in() as usize))
+}
+
+fn byte(data: &[u8], pos: &mut usize) -> Result<u8> {
+    let b = *data
+        .get(*pos)
+        .ok_or_else(|| anyhow::anyhow!("truncated pack/delta"))?;
+    *pos += 1;
+    Ok(b)
+}
+fn varint(data: &[u8], pos: &mut usize) -> Result<usize> {
+    let mut value = 0u64;
+    for shift in (0..63).step_by(7) {
+        let b = byte(data, pos)?;
+        value |= u64::from(b & 127) << shift;
+        if b & 128 == 0 {
+            return usize::try_from(value).map_err(Into::into);
+        }
+    }
+    bail!("overlong delta integer")
+}
+
+pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+    let mut pos = 0;
+    ensure!(
+        varint(delta, &mut pos)? == base.len(),
+        "delta base length mismatch"
+    );
+    let size = varint(delta, &mut pos)?;
+    ensure!(size <= MAX_OBJECT, "delta result exceeds limit");
+    let mut out = Vec::with_capacity(size);
+    while pos < delta.len() {
+        let op = byte(delta, &mut pos)?;
+        if op & 128 != 0 {
+            let mut offset = 0usize;
+            let mut len = 0usize;
+            for i in 0..4 {
+                if op & (1 << i) != 0 {
+                    offset |= usize::from(byte(delta, &mut pos)?) << (i * 8);
+                }
+            }
+            for i in 0..3 {
+                if op & (1 << (i + 4)) != 0 {
+                    len |= usize::from(byte(delta, &mut pos)?) << (i * 8);
+                }
+            }
+            if len == 0 {
+                len = 0x10000;
+            }
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| anyhow::anyhow!("delta offset overflow"))?;
+            ensure!(
+                end <= base.len() && len <= size.saturating_sub(out.len()),
+                "delta copy out of bounds"
+            );
+            out.extend_from_slice(&base[offset..end]);
+        } else {
+            let len = usize::from(op);
+            ensure!(
+                len != 0 && pos + len <= delta.len() && len <= size.saturating_sub(out.len()),
+                "invalid delta literal"
+            );
+            out.extend_from_slice(&delta[pos..pos + len]);
+            pos += len;
+        }
+    }
+    ensure!(out.len() == size, "delta result length mismatch");
+    Ok(out)
+}
+
+enum Base {
+    Offset(usize),
+    Id(Oid),
+}
+struct Delta {
+    offset: usize,
+    base: Base,
+    data: Vec<u8>,
+}
+
+pub fn decode(data: &[u8]) -> Result<Objects> {
+    ensure!(
+        (32..=MAX_PACK).contains(&data.len()),
+        "pack size outside limits"
+    );
+    ensure!(&data[..4] == b"PACK", "missing PACK signature");
+    let version = u32::from_be_bytes(data[4..8].try_into()?);
+    ensure!(version == 2 || version == 3, "unsupported pack version");
+    let count = u32::from_be_bytes(data[8..12].try_into()?) as usize;
+    ensure!(count <= MAX_OBJECTS, "pack object count exceeds limit");
+    let payload_end = data.len() - 20;
+    ensure!(
+        object::hash(&[&data[..payload_end]])?.0 == data[payload_end..],
+        "pack checksum mismatch"
+    );
+    let data = &data[..payload_end];
+    let mut pos = 12;
+    let mut objects = Objects::new();
+    let mut offsets = HashMap::new();
+    let mut depths = HashMap::new();
+    let mut pending = Vec::new();
+    let mut inflated = 0usize;
+    for _ in 0..count {
+        let offset = pos;
+        let first = byte(data, &mut pos)?;
+        let kind = (first >> 4) & 7;
+        let mut size = u64::from(first & 15);
+        let mut b = first;
+        let mut shift = 4;
+        while b & 128 != 0 {
+            ensure!(shift < 60, "overlong pack object size");
+            b = byte(data, &mut pos)?;
+            size |= u64::from(b & 127) << shift;
+            shift += 7;
+        }
+        let size = usize::try_from(size)?;
+        ensure!(size <= MAX_OBJECT, "pack object exceeds limit");
+        let base = match kind {
+            6 => {
+                let mut b = byte(data, &mut pos)?;
+                let mut back = usize::from(b & 127);
+                while b & 128 != 0 {
+                    b = byte(data, &mut pos)?;
+                    back = back
+                        .checked_add(1)
+                        .and_then(|n| n.checked_mul(128))
+                        .and_then(|n| n.checked_add(usize::from(b & 127)))
+                        .ok_or_else(|| anyhow::anyhow!("delta offset overflow"))?;
+                }
+                ensure!(back > 0 && back <= offset, "invalid delta base offset");
+                Some(Base::Offset(offset - back))
+            }
+            7 => {
+                ensure!(pos + 20 <= data.len(), "truncated delta base ID");
+                let id = Oid(data[pos..pos + 20].try_into()?);
+                pos += 20;
+                Some(Base::Id(id))
+            }
+            _ => {
+                Kind::from_number(kind)?;
+                None
+            }
+        };
+        inflated = inflated
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("size overflow"))?;
+        ensure!(inflated <= MAX_TOTAL, "pack inflated bytes exceed limit");
+        let (body, used) = inflate(&data[pos..], size)?;
+        pos += used;
+        if let Some(base) = base {
+            pending.push(Delta {
+                offset,
+                base,
+                data: body,
+            });
+        } else {
+            let object = Arc::new(Object {
+                kind: Kind::from_number(kind)?,
+                data: body,
+            });
+            let id = object.oid()?;
+            offsets.insert(offset, id);
+            depths.insert(id, 0usize);
+            objects.insert(id, object);
+        }
+    }
+    ensure!(pos == data.len(), "trailing bytes before pack checksum");
+    for _ in 0..64 {
+        if pending.is_empty() {
+            return Ok(objects);
+        }
+        let mut next = Vec::new();
+        let mut progress = false;
+        for delta in pending {
+            let id = match delta.base {
+                Base::Offset(n) => offsets.get(&n).copied(),
+                Base::Id(id) => Some(id),
+            };
+            let base = id.and_then(|id| objects.get(&id).map(|obj| (id, Arc::clone(obj))));
+            if let Some((id, base)) = base {
+                let depth = depths[&id] + 1;
+                ensure!(depth <= 64, "delta chain exceeds limit");
+                let body = apply_delta(&base.data, &delta.data)?;
+                inflated = inflated
+                    .checked_add(body.len())
+                    .ok_or_else(|| anyhow::anyhow!("size overflow"))?;
+                ensure!(inflated <= MAX_TOTAL, "resolved pack bytes exceed limit");
+                let object = Arc::new(Object {
+                    kind: base.kind,
+                    data: body,
+                });
+                let id = object.oid()?;
+                offsets.insert(delta.offset, id);
+                depths.insert(id, depth);
+                objects.insert(id, object);
+                progress = true;
+            } else {
+                next.push(delta);
+            }
+        }
+        ensure!(
+            progress,
+            "unresolved delta base (thin packs are unsupported)"
+        );
+        pending = next;
+    }
+    ensure!(pending.is_empty(), "delta resolution exceeds limit");
+    Ok(objects)
+}
+
+pub fn encode(objects: &[Arc<Object>]) -> Result<Vec<u8>> {
+    ensure!(objects.len() <= MAX_OBJECTS, "too many objects to push");
+    let mut pack = Vec::from(&b"PACK\0\0\0\x02"[..]);
+    pack.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    for obj in objects {
+        let mut size = obj.data.len();
+        let mut b = ((obj.kind as u8) << 4) | (size & 15) as u8;
+        size >>= 4;
+        if size != 0 {
+            b |= 128;
+        }
+        pack.push(b);
+        while size != 0 {
+            let mut b = (size & 127) as u8;
+            size >>= 7;
+            if size != 0 {
+                b |= 128;
+            }
+            pack.push(b);
+        }
+        let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
+        z.write_all(&obj.data)?;
+        pack.extend(z.finish()?);
+        ensure!(pack.len() + 20 <= MAX_PACK, "outgoing pack exceeds limit");
+    }
+    let checksum = object::hash(&[&pack])?;
+    pack.extend(checksum.0);
+    Ok(pack)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_pack_entries_with_valid_checksums() {
+        // Exercise structural rejection beyond the outer checksum check.
+        for entry in [
+            vec![0x50],             // reserved type
+            vec![0x60, 0],          // zero OFS distance
+            vec![0x60, 127],        // OFS before pack header
+            vec![0x70, 1, 2, 3],    // truncated REF base
+            vec![0xb0; 12],         // overlong object size
+            vec![0x31, 0x78, 0x9c], // truncated zlib
+        ] {
+            let mut bytes = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+            bytes.extend(entry);
+            bytes.extend(object::hash(&[&bytes]).unwrap().0);
+            assert!(decode(&bytes).is_err());
+        }
+    }
+    #[test]
+    fn delta_boundaries() {
+        assert_eq!(
+            apply_delta(b"abc", &[3, 4, 0x90, 3, 1, b'd']).unwrap(),
+            b"abcd"
+        );
+        for bad in [
+            &[3, 3, 0][..],
+            &[3, 3, 0x91, 2, 3],
+            &[3, 3, 4, 1],
+            &[4, 3],
+            &[3, 0xff, 0xff],
+        ] {
+            assert!(apply_delta(b"abc", bad).is_err());
+        }
+    }
+    #[test]
+    fn pack_roundtrip_and_corruption() {
+        let obj = Arc::new(Object {
+            kind: Kind::Blob,
+            data: b"data".to_vec(),
+        });
+        let id = obj.oid().unwrap();
+        let mut bytes = encode(&[obj]).unwrap();
+        assert_eq!(decode(&bytes).unwrap()[&id].data, b"data");
+        bytes[15] ^= 1;
+        assert!(decode(&bytes).is_err());
+        for n in 0..bytes.len() {
+            assert!(decode(&bytes[..n]).is_err());
+        }
+    }
+}

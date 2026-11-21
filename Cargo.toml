@@ -1,0 +1,29 @@
+[package]
+name = "safe-git"
+version = "0.1.0"
+edition = "2024"
+description = "A deliberately restricted Git transfer client"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+flate2 = { version = "1", default-features = false, features = ["miniz_oxide"] }
+hex = "0.4"
+rustix = { version = "1", features = ["fs"] }
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
+sha1-checked = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net"] }
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+overflow-checks = true
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
