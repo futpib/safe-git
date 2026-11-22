@@ -56,6 +56,13 @@ pub fn refname(name: &str) -> Result<()> {
     }
     Ok(())
 }
+pub fn reference(name: &str) -> Result<()> {
+    if matches!(name, "HEAD" | "AUR_SEEN") {
+        Ok(())
+    } else {
+        refname(name)
+    }
+}
 pub fn branch(name: &str) -> Result<String> {
     let short = name.strip_prefix("refs/heads/").unwrap_or(name);
     ensure!(
@@ -89,6 +96,13 @@ impl Repo {
         let root = File::from(fs::open(path, DIR, Mode::empty())?);
         let repo = Self::lock(root)?;
         repo.initialize(&initial, true)
+    }
+    pub fn init_bare_existing(path: &Path, initial: &str) -> Result<Self> {
+        let initial = branch(initial)?;
+        let root = File::from(fs::open(path, DIR, Mode::empty())?);
+        let repo = Self::lock(root)?;
+        repo.initialize(&initial, true)?;
+        Ok(repo)
     }
     /// Initialize metadata inside a private, empty clone staging directory.
     pub fn init_worktree(path: &Path, initial: &str) -> Result<Self> {
@@ -252,9 +266,10 @@ impl Repo {
         let value = std::str::from_utf8(&bytes)?
             .strip_suffix('\n')
             .unwrap_or(std::str::from_utf8(&bytes)?);
-        let name = value
-            .strip_prefix("ref: ")
-            .context("detached HEAD is unsupported")?;
+        let Some(name) = value.strip_prefix("ref: ") else {
+            parse_ref(value.as_bytes())?;
+            return Ok("HEAD".into());
+        };
         ensure!(
             name.starts_with("refs/heads/"),
             "HEAD must name a local branch"
@@ -263,8 +278,24 @@ impl Repo {
         Ok(name.to_owned())
     }
     pub fn read_ref(&self, name: &str) -> Result<Option<Oid>> {
-        refname(name)?;
-        if let Some(value) = self.read(name, 128)? {
+        self.read_ref_inner(name, &mut std::collections::HashSet::new())
+    }
+    fn read_ref_inner(
+        &self,
+        name: &str,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Result<Option<Oid>> {
+        reference(name)?;
+        ensure!(
+            seen.len() < 8 && seen.insert(name.to_owned()),
+            "cyclic or deep symbolic ref"
+        );
+        if let Some(value) = self.read(name, 2048)? {
+            if let Some(target) = value.strip_prefix(b"ref: ") {
+                let target = std::str::from_utf8(target)?.trim_end_matches('\n');
+                refname(target)?;
+                return self.read_ref_inner(target, seen);
+            }
             return Ok(Some(parse_ref(&value)?));
         }
         Ok(self.packed_refs()?.get(name).copied())
@@ -289,11 +320,77 @@ impl Repo {
         }
         Ok(refs)
     }
+    pub fn refs(&self) -> Result<std::collections::BTreeMap<String, Oid>> {
+        let mut result: std::collections::BTreeMap<_, _> =
+            self.packed_refs()?.into_iter().collect();
+        let mut pending = vec!["refs".to_owned()];
+        let mut count = 0;
+        while let Some(prefix) = pending.pop() {
+            let (dir, _) = self.parent(&format!("{prefix}/.check"), false)?;
+            for entry in fs::Dir::read_from(&dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_str()?;
+                if name == "." || name == ".." {
+                    continue;
+                }
+                count += 1;
+                ensure!(count <= MAX_OBJECTS, "too many refs");
+                if name.ends_with(".lock") {
+                    continue;
+                }
+                let path = format!("{prefix}/{name}");
+                refname(&path)?;
+                let stat = fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+                if stat.st_mode & 0o170000 == 0o40000 {
+                    pending.push(path);
+                } else {
+                    ensure!(
+                        stat.st_mode & 0o170000 == 0o100000,
+                        "ref must be a regular file"
+                    );
+                    if let Some(id) = self.read_ref(&path)? {
+                        result.insert(path, id);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+    pub fn remove(&self, path: &str) -> Result<()> {
+        let (dir, name) = match self.parent(path, false) {
+            Ok(v) => v,
+            Err(e) if missing(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        match fs::unlinkat(&dir, name.as_str(), AtFlags::empty()) {
+            Ok(()) => {
+                dir.sync_all()?;
+                Ok(())
+            }
+            Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+    pub fn delete_ref(&self, name: &str, expected: Oid) -> Result<()> {
+        let _lock = self.prepare_ref(name, Some(expected))?;
+        let mut lock = Pending::new(self.root.try_clone()?, "packed-refs.lock".into())?;
+        let mut packed = self.packed_refs()?;
+        if packed.remove(name).is_some() {
+            let mut out = String::new();
+            let sorted: std::collections::BTreeMap<_, _> = packed.into_iter().collect();
+            for (name, id) in sorted {
+                out.push_str(&format!("{id} {name}\n"));
+            }
+            lock.file.write_all(out.as_bytes())?;
+            lock.commit("packed-refs")?;
+        }
+        self.remove(name)
+    }
     pub fn update_ref(&self, name: &str, expected: Option<Oid>, new: Oid) -> Result<()> {
         self.prepare_ref(name, expected)?.commit(new)
     }
     pub(crate) fn prepare_ref(&self, name: &str, expected: Option<Oid>) -> Result<RefUpdate> {
-        refname(name)?;
+        reference(name)?;
         // A packed ref must not become a directory (or vice versa).
         // Check before creating parents so a failed update leaves no shadowing directory.
         for existing in self.packed_refs()?.keys() {
@@ -572,6 +669,45 @@ impl<'a> Store<'a> {
     }
 }
 impl Store<'_> {
+    pub fn ids(&mut self) -> Result<std::collections::BTreeSet<Oid>> {
+        if !self.packs_loaded {
+            self.packs()?;
+        }
+        let mut ids: std::collections::BTreeSet<_> = self.incoming.keys().copied().collect();
+        for p in &self.packs {
+            ids.extend(p.ids.keys().copied());
+            ensure!(ids.len() <= MAX_OBJECTS, "object count exceeds limit");
+        }
+        let (dir, _) = self.repo.parent("objects/.check", false)?;
+        let mut scanned = 0;
+        for entry in fs::Dir::read_from(&dir)? {
+            scanned += 1;
+            ensure!(
+                scanned <= MAX_OBJECTS * 2,
+                "object directory scan exceeds limit"
+            );
+            let entry = entry?;
+            let name = entry.file_name().to_str()?;
+            if name.len() != 2 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let (sub, _) = self.repo.parent(&format!("objects/{name}/.check"), false)?;
+            for file in fs::Dir::read_from(&sub)? {
+                scanned += 1;
+                ensure!(
+                    scanned <= MAX_OBJECTS * 2,
+                    "object directory scan exceeds limit"
+                );
+                let file = file?;
+                let suffix = file.file_name().to_str()?;
+                if suffix.len() == 38 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    ids.insert(Oid::parse(format!("{name}{suffix}").as_bytes())?);
+                }
+                ensure!(ids.len() <= MAX_OBJECTS, "object count exceeds limit");
+            }
+        }
+        Ok(ids)
+    }
     fn get_inner(&mut self, oid: Oid, depth: usize, decoded: &mut usize) -> Result<Arc<Object>> {
         ensure!(depth <= 64, "local delta chain exceeds limit");
         if let Some(obj) = self.incoming.get(&oid) {

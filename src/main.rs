@@ -1,13 +1,20 @@
+mod archive;
 mod checkout;
 mod clone;
+mod compat;
+mod config;
 mod index;
+mod network;
 mod object;
 mod output;
 mod pack;
 mod packed;
+mod porcelain;
 mod protocol;
 mod repo;
+mod revision;
 mod transport;
+mod trust;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -19,7 +26,8 @@ use transport::{Auth, Remote};
 #[derive(Parser)]
 #[command(
     version = env!("SAFE_GIT_VERSION"),
-    about = "Inert SSH clone, fetch, fast-forward pull/merge, and push"
+    about = "Git operations without repository-directed execution",
+    after_help = "Package-manager commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, reset --hard, checkout, rebase, diff, log, commit, tag --list,\nrev-list, describe, archive --format tar. Unsupported options fail closed."
 )]
 struct Cli {
     /// Working-tree root or bare repository; never discovers parent repositories
@@ -48,21 +56,35 @@ struct Cli {
     /// Suppress successful operation summaries
     #[arg(short, long, global = true)]
     quiet: bool,
+    /// Inert configuration values for this invocation; never enables commands
+    #[arg(short = 'c', global = true)]
+    config: Vec<String>,
     #[command(subcommand)]
     command: Command,
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Clone one branch into a new or empty ordinary working tree
+    /// Clone verified objects into a new or empty repository
     Clone {
         /// Select a branch instead of the remote's advertised default
         #[arg(short, long)]
         branch: Option<String>,
-        /// All safe-git clones fetch only the selected branch
+        /// Fetch only the selected branch
         #[arg(long)]
         single_branch: bool,
+        #[arg(long)]
+        bare: bool,
+        #[arg(long)]
+        mirror: bool,
+        #[arg(short = 'o', long, default_value = "origin")]
+        origin: String,
+        #[arg(long)]
+        no_progress: bool,
+        /// Accepted for compatibility; objects are copied and verified, never shared
+        #[arg(short = 's', long)]
+        shared: bool,
         url: String,
-        path: PathBuf,
+        path: Option<PathBuf>,
     },
     /// Create a new bare SHA-1 repository
     Init {
@@ -79,6 +101,14 @@ enum Command {
         /// Storage label only; never resolves a configured remote
         #[arg(long, default_value = "origin")]
         remote: String,
+        #[arg(long)]
+        all: bool,
+        #[arg(short, long)]
+        prune: bool,
+        #[arg(short, long)]
+        verbose: bool,
+        #[arg(long)]
+        tags: bool,
     },
     /// Fetch one branch and fast-forward under one repository lock
     Pull {
@@ -95,13 +125,17 @@ enum Command {
     },
     /// Fast-forward the current branch and update its working tree, if present
     Merge {
-        #[arg(long, required = true)]
+        #[arg(long)]
         ff_only: bool,
-        /// Omit the diffstat
         #[arg(long)]
         no_stat: bool,
-        /// origin/main or refs/remotes/origin/main
-        reference: String,
+        #[arg(long)]
+        no_edit: bool,
+        #[arg(long)]
+        no_ff: bool,
+        #[arg(long)]
+        no_commit: bool,
+        reference: Option<String>,
     },
     /// Push one local branch to one remote branch, fast-forward only
     Push {
@@ -111,6 +145,9 @@ enum Command {
     },
     /// Recover an interrupted safe-git working-tree update from its verified backups
     Recover,
+    /// Additional inert Git commands used by package managers
+    #[command(external_subcommand)]
+    Compatibility(Vec<String>),
 }
 
 impl Cli {
@@ -135,17 +172,45 @@ impl Cli {
 }
 
 async fn run(cli: &Cli) -> Result<()> {
+    if let Command::Compatibility(args) = &cli.command {
+        return compat::run(cli, args).await;
+    }
     if let Command::Clone {
-        url, path, branch, ..
+        url,
+        path,
+        branch,
+        single_branch,
+        bare,
+        mirror,
+        origin,
+        ..
     } = &cli.command
     {
+        let path = path.clone().unwrap_or_else(|| {
+            let name = url
+                .trim_end_matches('/')
+                .rsplit(['/', ':'])
+                .next()
+                .unwrap_or("repository");
+            PathBuf::from(if *bare || *mirror {
+                name.to_owned()
+            } else {
+                name.trim_end_matches(".git").to_owned()
+            })
+        });
         return clone::run(
-            &cli.repository.join(path),
-            path,
-            url,
+            &cli.repository.join(&path),
+            &path,
+            &network::normalize_from(url, &cli.repository)?,
             &cli.auth()?,
-            branch.as_deref(),
-            cli.quiet,
+            clone::Options {
+                branch: branch.as_deref(),
+                remote: origin,
+                single: *single_branch,
+                bare: *bare || *mirror,
+                mirror: *mirror,
+                quiet: cli.quiet,
+            },
         )
         .await;
     }
@@ -178,21 +243,39 @@ async fn run(cli: &Cli) -> Result<()> {
     );
     let mut store = Store::new(&repo);
     match &cli.command {
-        Command::Clone { .. } | Command::Init { .. } | Command::Recover => unreachable!(),
+        Command::Clone { .. }
+        | Command::Init { .. }
+        | Command::Recover
+        | Command::Compatibility(_) => unreachable!(),
         Command::Fetch {
             url,
             branch,
             remote,
+            prune,
+            all,
+            ..
         } => {
-            fetch(
-                cli,
-                &repo,
-                &mut store,
-                url.as_deref(),
-                branch.as_deref(),
-                Some(remote),
-            )
-            .await?;
+            if branch.is_none()
+                && cli.remote_url.is_none()
+                && (url.is_none()
+                    || trust::get(&repo)?.is_some_and(|b| url.as_deref() == Some(&b.remote)))
+            {
+                compat::fetch_all(cli, &repo, &mut store, *prune).await?;
+            } else {
+                ensure!(
+                    !all && !prune,
+                    "--all/--prune require the registered remote"
+                );
+                fetch(
+                    cli,
+                    &repo,
+                    &mut store,
+                    url.as_deref(),
+                    branch.as_deref(),
+                    Some(remote),
+                )
+                .await?;
+            }
         }
         Command::Pull {
             url,
@@ -214,22 +297,28 @@ async fn run(cli: &Cli) -> Result<()> {
             merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;
         }
         Command::Merge {
-            reference, no_stat, ..
+            reference,
+            no_stat,
+            ff_only,
+            no_ff,
+            no_commit,
+            ..
         } => {
-            let reference = if reference.starts_with("refs/") {
-                reference.clone()
-            } else {
-                format!("refs/remotes/{reference}")
+            let reference = match reference {
+                Some(r) => r.clone(),
+                None => revision::upstream(&repo)?,
             };
-            ensure!(
-                reference.starts_with("refs/remotes/"),
-                "merge requires a fetched tracking ref"
-            );
-            repo::refname(&reference)?;
-            let incoming = repo
-                .read_ref(&reference)?
-                .context("tracking ref does not exist; fetch first")?;
-            merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;
+            let incoming = revision::commit(&repo, &mut store, &reference)?;
+            if *ff_only {
+                ensure!(!no_ff && !no_commit, "incompatible merge options");
+                merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;
+            } else {
+                ensure!(
+                    *no_ff && *no_commit,
+                    "merge requires --ff-only or --no-ff --no-commit"
+                );
+                porcelain::review_merge(&repo, &mut store, incoming, cli.quiet)?;
+            }
         }
         Command::Push { url, refspec } => {
             let head = repo.head()?;
@@ -322,8 +411,16 @@ async fn fetch(
         }
     }
     let boundary = commits(store, &haves)?;
-    let (tip, objects) =
-        protocol::fetch(&cli.endpoint(url)?, &cli.auth()?, &branch, None, &haves).await?;
+    let endpoint = network::normalize_from(cli.url(url)?, &cli.repository)?;
+    let ad = network::discover(&endpoint, &cli.auth()?).await?;
+    let tip = ad.branch(&branch).context("remote branch does not exist")?;
+    let objects = network::fetch(
+        &endpoint,
+        &cli.auth()?,
+        &std::collections::HashMap::from([(format!("refs/heads/{branch}"), tip)]),
+        &haves,
+    )
+    .await?;
     store.add(objects)?;
     store.get(tip)?.commit()?;
     let ids = reachable_since(store, tip, &boundary)?;
@@ -425,6 +522,9 @@ async fn main() {
         .context("operation timed out")
         .and_then(|r| r);
     if let Err(error) = result {
+        if let Some(status) = error.downcast_ref::<compat::Exit>() {
+            std::process::exit(status.0);
+        }
         // Escape all diagnostics so server/repository strings cannot control the terminal.
         eprintln!("fatal: {}", format!("{error:#}").escape_debug());
         std::process::exit(128);

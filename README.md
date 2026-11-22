@@ -1,16 +1,16 @@
 # safe-git
 
 A Git CLI that **does not trust the repository it works on**. Its purpose is to
-clone, fetch, fast-forward, and push without executing anything an attacker puts
+clone, inspect, update, and push without executing anything an attacker puts
 in the repository.
 
-Git and SSH are implemented in-process in Rust. There is no shell, subprocess,
+Git, SSH, and HTTP are implemented in-process in Rust. There is no shell, subprocess,
 or fallback to Git. Hooks, filters, command aliases, credential helpers, and
 external diff tools are never run. Repository content and metadata are treated
 as untrusted data, never instructions to execute.
 
-You choose the remote explicitly; repository configuration cannot redirect
-authenticated connections or pushes.
+Clone remembers your chosen endpoint in trusted host state. Repository
+configuration cannot redirect subsequent fetches or authenticated pushes.
 
 Install from this source checkout on Linux with Rust:
 
@@ -31,7 +31,8 @@ safe-git push
 SSH uses your agent or default keys in `~/.ssh`; a verified host key must already
 be in `~/.ssh/known_hosts`. Your host environment and credentials are trusted.
 Run `safe-git --help` for options, bare-repository initialization, and checkout
-recovery. Only this small subset of Git operations is supported.
+recovery. See [package-manager compatibility](COMPATIBILITY.md) for the supported
+paru/makepkg commands and deliberate restrictions.
 
 Experimental and unaudited. Preventing repository-directed execution is the
 design, not a guarantee against implementation or dependency bugs. There is no

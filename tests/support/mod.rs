@@ -1,3 +1,4 @@
+pub mod http;
 pub mod service;
 
 use std::{
@@ -47,6 +48,11 @@ impl TestCommand {
             command,
             input: Vec::new(),
         }
+    }
+
+    pub fn current_dir(mut self, path: impl AsRef<Path>) -> Self {
+        self.command.current_dir(path);
+        self
     }
 
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
@@ -394,6 +400,7 @@ impl Fixture {
     }
     pub fn safe(&self, repo: &Path) -> TestCommand {
         TestCommand::new(BIN)
+            .env("SAFE_GIT_STATE_DIR", self.root().join("state"))
             .arg("-C")
             .arg(repo)
             .arg("--identity-file")

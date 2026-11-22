@@ -1,10 +1,10 @@
 //! Single-branch clone into private staging, then atomic directory publication.
 use crate::{
-    checkout,
-    object::{ReadObjects, reachable},
-    protocol,
+    checkout, network,
+    object::ReadObjects,
     repo::{Repo, Store},
-    transport::{Auth, Remote},
+    transport::Auth,
+    trust,
 };
 use anyhow::{Context, Result, ensure};
 use rustix::fs::{self, CWD, RenameFlags};
@@ -88,64 +88,125 @@ impl Destination {
     }
 }
 
-fn config_value(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+pub struct Options<'a> {
+    pub branch: Option<&'a str>,
+    pub remote: &'a str,
+    pub single: bool,
+    pub bare: bool,
+    pub mirror: bool,
+    pub quiet: bool,
 }
-
 pub async fn run(
     destination: &Path,
     display: &Path,
     url: &str,
     auth: &Auth,
-    branch: Option<&str>,
-    quiet: bool,
+    options: Options<'_>,
 ) -> Result<()> {
-    let remote = Remote::parse(url)?;
-    if let Some(branch) = branch {
-        crate::repo::branch(branch)?;
-    }
+    let url = network::normalize(url)?;
+    crate::repo::tracking(options.remote, "check")?;
     let destination = Destination::new(destination)?;
-    if !quiet {
+    if !options.quiet {
         eprintln!(
-            "Cloning into '{}'...",
+            "Cloning into {}'{}'...",
+            if options.bare { "bare repository " } else { "" },
             display.display().to_string().escape_debug()
         );
     }
-    let advertisement = protocol::discover(&remote, auth).await?;
-    let (branch, expected) = advertisement.clone_branch(branch)?;
+    let ad = network::discover(&url, auth).await?;
+    let (branch, expected) = ad.clone_branch(options.branch)?;
     ensure!(
         branch != "HEAD" && !branch.starts_with("HEAD/"),
-        "branch conflicts with origin/HEAD"
+        "branch conflicts with remote HEAD"
     );
-    let repo = Repo::init_worktree(destination.staging.path(), &branch)?;
-    if let Some(expected) = expected {
-        let (tip, objects) = protocol::fetch(&remote, auth, &branch, Some(expected), &[]).await?;
-        let mut store = Store::new(&repo);
-        store.add(objects)?;
-        store.get(tip)?.commit()?;
-        for id in reachable(&mut store, tip)? {
-            repo.write_object(store.get(id)?.as_ref())?;
-        }
-        repo.update_ref(&crate::repo::tracking("origin", &branch)?, None, tip)?;
-        checkout::merge(&repo, &mut store, &repo.head()?, None, tip)?;
-        repo.atomic(
-            "refs/remotes/origin/HEAD",
-            format!("ref: refs/remotes/origin/{branch}\n").as_bytes(),
-        )?;
+    let repo = if options.bare {
+        Repo::init_bare_existing(destination.staging.path(), &branch)?
     } else {
+        Repo::init_worktree(destination.staging.path(), &branch)?
+    };
+    let selected: std::collections::HashMap<_, _> = ad
+        .refs
+        .iter()
+        .filter(|(name, _)| {
+            !name.ends_with("^{}")
+                && if options.mirror {
+                    name.starts_with("refs/")
+                } else if options.single {
+                    **name == format!("refs/heads/{branch}")
+                } else {
+                    name.starts_with("refs/heads/") || name.starts_with("refs/tags/")
+                }
+        })
+        .map(|(n, id)| (n.clone(), *id))
+        .collect();
+    ensure!(
+        !selected.keys().any(|n| n.starts_with("refs/replace/")),
+        "replacement refs are unsupported"
+    );
+    let objects = network::fetch(&url, auth, &selected, &[]).await?;
+    let mut store = Store::new(&repo);
+    store.add(objects)?;
+    for (name, id) in &selected {
+        if name.starts_with("refs/heads/") {
+            store.get(*id)?.commit()?;
+        }
+    }
+    let ids = crate::object::reachable_many_since(
+        &mut store,
+        &selected.values().copied().collect::<Vec<_>>(),
+        &std::collections::HashSet::new(),
+    )?;
+    for id in ids {
+        repo.write_object(store.get(id)?.as_ref())?;
+    }
+    for (name, id) in &selected {
+        let dest = if options.bare || name.starts_with("refs/tags/") {
+            name.clone()
+        } else {
+            crate::repo::tracking(options.remote, name.strip_prefix("refs/heads/").unwrap())?
+        };
+        repo.update_ref(&dest, None, *id)?;
+    }
+    if let Some(tip) = expected {
+        if !options.bare {
+            checkout::merge(&repo, &mut store, &repo.head()?, None, tip)?;
+            repo.atomic(
+                &format!("refs/remotes/{}/HEAD", options.remote),
+                format!("ref: refs/remotes/{}/{branch}\n", options.remote).as_bytes(),
+            )?;
+        }
+    } else if !options.quiet {
         eprintln!("warning: You appear to have cloned an empty repository.");
     }
-    // Store only caller-selected endpoint and validated branch data for Git
-    // interoperability. safe-git never reads remote/upstream configuration.
+    let quote = crate::config::quote;
+    let refspec = if options.mirror {
+        "+refs/*:refs/*".to_owned()
+    } else if options.single {
+        format!(
+            "+refs/heads/{branch}:refs/remotes/{}/{branch}",
+            options.remote
+        )
+    } else {
+        format!("+refs/heads/*:refs/remotes/{}/*", options.remote)
+    };
     repo.atomic("config", format!(
-        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n[remote \"origin\"]\n\turl = {}\n\tfetch = {}\n[branch {}]\n\tremote = origin\n\tmerge = {}\n",
-        config_value(url),
-        config_value(&format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")),
-        config_value(&branch),
-        config_value(&format!("refs/heads/{branch}")),
+        "[core]\n\trepositoryformatversion = 0\n\tbare = {}\n[remote {}]\n\turl = {}\n\tfetch = {}\n[branch {}]\n\tremote = {}\n\tmerge = {}\n",
+        options.bare,quote(options.remote),quote(&url),quote(&refspec),quote(&branch),quote(options.remote),quote(&format!("refs/heads/{branch}")),
     ).as_bytes())?;
-    drop(repo);
-    destination.publish()
+    destination.publish()?;
+    // Bind both directory identity and its final location in trusted host state.
+    trust::save(
+        &repo,
+        &trust::Binding {
+            url,
+            remote: options.remote.into(),
+            branch,
+            single: options.single,
+            mirror: options.mirror,
+            bare: options.bare,
+        },
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

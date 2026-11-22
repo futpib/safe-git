@@ -23,14 +23,14 @@ const DIR: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::CLOEXEC)
     .union(OFlags::NOFOLLOW);
-const INDEX_LIMIT: usize = 64 * 1024 * 1024;
+pub(crate) const INDEX_LIMIT: usize = 64 * 1024 * 1024;
 
-struct Work<'a> {
+pub(crate) struct Work<'a> {
     root: &'a File,
     device: u64,
 }
 impl<'a> Work<'a> {
-    fn new(repo: &'a Repo) -> Result<Self> {
+    pub(crate) fn new(repo: &'a Repo) -> Result<Self> {
         let root = repo
             .worktree
             .as_ref()
@@ -59,7 +59,7 @@ impl<'a> Work<'a> {
         }
         Ok((dir, name))
     }
-    fn state(&self, path: &[u8]) -> Result<Option<Entry>> {
+    pub(crate) fn state(&self, path: &[u8]) -> Result<Option<Entry>> {
         let (dir, name) = match self.parent(path) {
             Ok(v) => v,
             Err(e) if missing(&e) => return Ok(None),
@@ -127,8 +127,8 @@ fn entry_at(dir: &File, name: &[u8], device: u64) -> Result<Option<Entry>> {
             )?);
             let meta = file.metadata()?;
             ensure!(
-                meta.is_file() && meta.dev() == device,
-                "worktree file changed type"
+                meta.is_file() && meta.dev() == device && meta.nlink() == 1,
+                "worktree file changed type or has external hard links"
             );
             let mut bytes = Vec::new();
             file.take(MAX_OBJECT as u64 + 1).read_to_end(&mut bytes)?;
@@ -161,7 +161,7 @@ fn entry_at(dir: &File, name: &[u8], device: u64) -> Result<Option<Entry>> {
         .oid()?,
     }))
 }
-fn symlink_target(path: &[u8], target: &[u8]) -> Result<()> {
+pub(crate) fn symlink_target(path: &[u8], target: &[u8]) -> Result<()> {
     ensure!(
         !target.is_empty()
             && target.len() <= 4096
@@ -200,6 +200,14 @@ struct Change {
 struct Journal {
     version: u8,
     head: String,
+    #[serde(default)]
+    reference: Option<String>,
+    #[serde(default)]
+    head_after: Option<String>,
+    #[serde(default)]
+    head_before: Option<Vec<u8>>,
+    #[serde(default)]
+    head_lock: Option<u64>,
     old: Option<Oid>,
     new: Oid,
     index_old: Option<Oid>,
@@ -212,14 +220,42 @@ struct Journal {
 impl Journal {
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.version == 1
+            (self.version == 1 || self.version == 2)
                 && self.changes.len() <= MAX_OBJECTS
                 && self.dirs.len() <= MAX_OBJECTS,
             "invalid checkout journal"
         );
-        crate::repo::refname(&self.head)?;
+        crate::repo::reference(&self.head)?;
+        if self.version == 2 {
+            let bytes = self.head_before.as_deref().context("missing saved HEAD")?;
+            let value = std::str::from_utf8(bytes)?.trim_end_matches('\n');
+            if let Some(name) = value.strip_prefix("ref: ") {
+                ensure!(
+                    name == self.head && name.starts_with("refs/heads/"),
+                    "invalid saved HEAD"
+                );
+                crate::repo::refname(name)?;
+            } else {
+                ensure!(self.head == "HEAD", "invalid detached saved HEAD");
+                Oid::parse(value.as_bytes())?;
+            }
+        }
+        if let Some(reference) = &self.reference {
+            crate::repo::reference(reference)?;
+            ensure!(
+                reference == "HEAD" || reference.starts_with("refs/heads/"),
+                "invalid checkout reference"
+            );
+        }
+        if let Some(head) = &self.head_after {
+            if head.starts_with("refs/heads/") {
+                crate::repo::refname(head)?;
+            } else {
+                Oid::parse(head.as_bytes())?;
+            }
+        }
         ensure!(
-            self.head.starts_with("refs/heads/") && self.new != Oid::ZERO,
+            (self.head == "HEAD" || self.head.starts_with("refs/heads/")) && self.new != Oid::ZERO,
             "invalid journal branch"
         );
         let mut names = BTreeSet::new();
@@ -245,6 +281,42 @@ pub fn merge(
     old: Option<Oid>,
     new: Oid,
 ) -> Result<()> {
+    let after = index::tree(store, Some(new))?;
+    apply(
+        repo,
+        store,
+        Update {
+            reference: head,
+            old,
+            new,
+            after,
+            force: false,
+            head_after: None,
+            reset: false,
+        },
+    )
+}
+
+pub struct Update<'a> {
+    pub reference: &'a str,
+    pub old: Option<Oid>,
+    pub new: Oid,
+    pub after: Entries,
+    pub force: bool,
+    pub head_after: Option<String>,
+    pub reset: bool,
+}
+pub fn apply(repo: &Repo, store: &mut Store<'_>, update: Update<'_>) -> Result<()> {
+    let Update {
+        reference,
+        old,
+        new,
+        after,
+        force,
+        head_after,
+        reset,
+    } = update;
+    let head = repo.head()?;
     ensure!(
         !repo.exists(TXN)?,
         "interrupted checkout; run safe-git recover"
@@ -256,10 +328,20 @@ pub fn merge(
         "rebase-apply",
         "rebase-merge",
     ] {
-        ensure!(!repo.exists(state)?, "unfinished Git operation: {state}");
+        ensure!(
+            (reset && state == "MERGE_HEAD") || !repo.exists(state)?,
+            "unfinished Git operation: {state}"
+        );
     }
     let work = Work::new(repo)?;
-    let ref_update = repo.prepare_ref(head, old)?;
+    let ref_update = repo.prepare_ref(reference, old)?;
+    let mut head_lock = if reference != "HEAD" {
+        Some(Pending::new(repo.root.try_clone()?, "HEAD.lock".into())?)
+    } else {
+        None
+    };
+    ensure!(repo.head()? == head, "HEAD changed concurrently; retry");
+    let head_before = repo.read("HEAD", 2048)?.context("missing HEAD")?;
     let mut index_lock = Pending::new(repo.root.try_clone()?, "index.lock".into())
         .context("acquire Git index lock")?;
     let original = repo.read("index", INDEX_LIMIT)?;
@@ -267,9 +349,13 @@ pub fn merge(
         Some(bytes) => index::decode(bytes)?,
         None => Entries::new(),
     };
-    let before = index::tree(store, old)?;
-    let after = index::tree(store, Some(new))?;
-    let keys: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+    let before = index::tree(store, repo.read_ref(&head)?)?;
+    let keys: BTreeSet<_> = before
+        .keys()
+        .chain(after.keys())
+        .chain(index.keys())
+        .cloned()
+        .collect();
     let mut changes = Vec::new();
     let mut contents = Vec::<Option<Arc<Object>>>::new();
     let mut dirs = BTreeSet::new();
@@ -278,11 +364,11 @@ pub fn merge(
         let a = before.get(&path).copied();
         let b = after.get(&path).copied();
         let staged = index.get(&path).copied();
-        if a == b || staged == b {
+        if !force && (a == b || staged == b) {
             continue;
         }
         ensure!(
-            staged == a,
+            force || staged == a,
             "staged changes would be overwritten at {:?}",
             String::from_utf8_lossy(&path)
         );
@@ -298,11 +384,11 @@ pub fn merge(
         } else {
             let actual = work.state(&path)?;
             ensure!(
-                actual == a || (actual.is_none() && b.is_none()),
+                force || actual == a || (actual.is_none() && b.is_none()),
                 "local changes or untracked data would be overwritten at {:?}",
                 String::from_utf8_lossy(&path)
             );
-            if actual.is_some() || b.is_some() {
+            if actual != b {
                 let content = if let Some(entry) = b {
                     work.plan_directories(&path, false, &mut dirs)?;
                     let object = store.get(entry.oid)?;
@@ -333,8 +419,15 @@ pub fn merge(
     index::no_prefix_conflicts(&index)?;
     let new_index = index::encode(&index)?;
     let journal = Journal {
-        version: 1,
-        head: head.into(),
+        version: 2,
+        head: head.clone(),
+        reference: Some(reference.into()),
+        head_after,
+        head_before: Some(head_before.clone()),
+        head_lock: head_lock
+            .as_ref()
+            .map(|l| l.file.metadata().map(|m| m.ino()))
+            .transpose()?,
         old,
         new,
         index_old: original.as_ref().map(|b| object::hash(&[b])).transpose()?,
@@ -411,13 +504,20 @@ pub fn merge(
                 txn.sync_all()?;
             }
         }
-        ensure!(repo.head()? == head, "HEAD changed during checkout");
+        ensure!(
+            repo.read("HEAD", 2048)?.as_deref() == Some(head_before.as_slice()),
+            "HEAD changed during checkout"
+        );
         index_lock.file.write_all(&new_index)?;
         index_lock.commit("index")?;
         ref_update.commit(new)?;
+        // Equal-tip updates (reset HEAD and a review merge) need their own commit marker.
+        repo.atomic(&format!("{TXN}/committed"), b"done\n")?;
+        finish_head(repo, &journal, head_lock.as_mut())?;
         Ok(())
     })();
     drop(index_lock);
+    drop(head_lock);
     match apply {
         Ok(()) => cleanup(repo, &txn, &journal),
         Err(error) => {
@@ -427,6 +527,74 @@ pub fn merge(
         }
     }
 }
+fn finish_head(repo: &Repo, journal: &Journal, lock: Option<&mut Pending>) -> Result<()> {
+    if let Some(head) = &journal.head_after {
+        let bytes = if head.starts_with("refs/heads/") {
+            format!("ref: {head}\n")
+        } else {
+            format!("{head}\n")
+        };
+        if repo.read("HEAD", 2048)?.as_deref() == Some(bytes.as_bytes()) {
+            return Ok(());
+        }
+        let lock = lock.context("HEAD update has no lock")?;
+        lock.file.write_all(bytes.as_bytes())?;
+        lock.commit("HEAD")?;
+    }
+    Ok(())
+}
+
+/// Snapshot only named tracked files. Symlinks are read as link text; never followed.
+pub fn snapshot(repo: &Repo, entries: &Entries) -> Result<Entries> {
+    let work = Work::new(repo)?;
+    let mut result = Entries::new();
+    let mut total = 0;
+    for (path, entry) in entries {
+        if entry.mode == 0o160000 {
+            result.insert(path.clone(), *entry);
+            continue;
+        }
+        let (dir, name) = match work.parent(path) {
+            Ok(v) => v,
+            Err(e) if missing(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        let Some(actual) = entry_at(&dir, &name, work.device)? else {
+            continue;
+        };
+        index::mode(actual.mode)?;
+        let data = if actual.mode == 0o120000 {
+            fs::readlinkat(&dir, name.as_slice(), Vec::new())?.into_bytes()
+        } else {
+            let file = File::from(fs::openat(
+                &dir,
+                name.as_slice(),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            let meta = file.metadata()?;
+            ensure!(
+                meta.is_file() && meta.nlink() == 1,
+                "tracked file changed type or has external hard links"
+            );
+            let mut data = Vec::new();
+            file.take(MAX_OBJECT as u64 + 1).read_to_end(&mut data)?;
+            data
+        };
+        ensure!(data.len() <= MAX_OBJECT, "worktree file exceeds limit");
+        total += data.len();
+        ensure!(total <= MAX_TOTAL, "worktree snapshot exceeds limit");
+        let obj = Object {
+            kind: Kind::Blob,
+            data,
+        };
+        ensure!(obj.oid()? == actual.oid, "worktree changed during snapshot");
+        repo.write_object(&obj)?;
+        result.insert(path.clone(), actual);
+    }
+    Ok(result)
+}
+
 fn write_new(dir: &File, name: &str, bytes: &[u8], mode: u32) -> Result<()> {
     let mut file = File::from(fs::openat(
         dir,
@@ -460,6 +628,8 @@ fn cleanup(repo: &Repo, txn: &File, journal: &Journal) -> Result<()> {
     unlink_if_present(txn, "index-old")?;
     unlink_if_present(txn, "journal")?;
     txn.sync_all()?;
+    unlink_if_present(txn, "committed")?;
+    txn.sync_all()?;
     fs::unlinkat(&repo.root, TXN, AtFlags::REMOVEDIR)?;
     repo.root.sync_all()?;
     Ok(())
@@ -481,28 +651,55 @@ fn release_our_lock(repo: &Repo, path: &str, inode: u64) -> Result<()> {
 }
 pub fn recover(repo: &Repo) -> Result<()> {
     let work = Work::new(repo)?;
-    let bytes = repo
-        .read(&format!("{TXN}/journal"), INDEX_LIMIT)?
-        .context("no complete checkout journal; no automatic recovery is possible")?;
+    let Some(bytes) = repo.read(&format!("{TXN}/journal"), INDEX_LIMIT)? else {
+        let txn = File::from(fs::openat(&repo.root, TXN, DIR, Mode::empty())?);
+        for entry in fs::Dir::read_from(&txn)? {
+            let entry = entry?;
+            ensure!(
+                matches!(entry.file_name().to_bytes(), b"." | b".." | b"committed"),
+                "no complete checkout journal; preserve staging for manual recovery"
+            );
+        }
+        unlink_if_present(&txn, "committed")?;
+        fs::unlinkat(&repo.root, TXN, AtFlags::REMOVEDIR)?;
+        repo.root.sync_all()?;
+        return Ok(());
+    };
     let journal: Journal = serde_json::from_slice(&bytes)?;
     journal.validate()?;
     let txn = File::from(fs::openat(&repo.root, TXN, DIR, Mode::empty())?);
     ensure!(
-        repo.head()? == journal.head,
+        repo.head()? == journal.head
+            || journal.head_after.as_ref().is_some_and(|h| repo
+                .head()
+                .is_ok_and(|v| v == *h || (v == "HEAD" && Oid::parse(h.as_bytes()).is_ok()))),
         "HEAD differs from interrupted checkout; preserve backups and recover manually"
     );
-    let tip = repo.read_ref(&journal.head)?;
+    let reference = journal.reference.as_deref().unwrap_or(&journal.head);
+    let tip = repo.read_ref(reference)?;
     ensure!(
         tip == journal.old || tip == Some(journal.new),
         "branch changed since interrupted checkout"
     );
     release_our_lock(repo, "index.lock", journal.index_lock)?;
-    release_our_lock(repo, &format!("{}.lock", journal.head), journal.ref_lock)?;
-    let _branch_lock = repo.prepare_ref(&journal.head, tip)?;
+    release_our_lock(repo, &format!("{reference}.lock"), journal.ref_lock)?;
+    if let Some(inode) = journal.head_lock {
+        release_our_lock(repo, "HEAD.lock", inode)?;
+    }
+    let _branch_lock = repo.prepare_ref(reference, tip)?;
+    let mut head_lock = if reference != "HEAD" {
+        Some(Pending::new(repo.root.try_clone()?, "HEAD.lock".into())?)
+    } else {
+        None
+    };
     let mut index_lock = Pending::new(repo.root.try_clone()?, "index.lock".into())?;
-    if tip == Some(journal.new) {
+    if tip == Some(journal.new)
+        && (journal.old != Some(journal.new)
+            || repo.read(&format!("{TXN}/committed"), 16)?.as_deref() == Some(b"done\n"))
+    {
         // The ref was committed last: all file/index changes finished. Leave any
         // subsequent user edits alone and only remove our backup files.
+        finish_head(repo, &journal, head_lock.as_mut())?;
         return cleanup(repo, &txn, &journal);
     }
     let old_index = repo.read(&format!("{TXN}/index-old"), INDEX_LIMIT)?;

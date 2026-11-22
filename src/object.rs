@@ -162,7 +162,40 @@ impl Object {
                 Ok(out)
             }
             Kind::Blob => Ok(Vec::new()),
-            Kind::Tag => bail!("tags are not branch tips"),
+            Kind::Tag => {
+                let end = self
+                    .data
+                    .windows(2)
+                    .position(|w| w == b"\n\n")
+                    .ok_or_else(|| anyhow::anyhow!("tag has no header terminator"))?;
+                ensure!(
+                    end <= 1024 * 1024 && !self.data[..end].contains(&0),
+                    "invalid tag header"
+                );
+                let mut lines = self.data[..end].split(|b| *b == b'\n');
+                let id = Oid::parse(
+                    lines
+                        .next()
+                        .unwrap_or_default()
+                        .strip_prefix(b"object ")
+                        .ok_or_else(|| anyhow::anyhow!("invalid tag target"))?,
+                )?;
+                let kind = Kind::parse(
+                    lines
+                        .next()
+                        .unwrap_or_default()
+                        .strip_prefix(b"type ")
+                        .ok_or_else(|| anyhow::anyhow!("invalid tag target type"))?,
+                )?;
+                ensure!(
+                    lines
+                        .next()
+                        .and_then(|l| l.strip_prefix(b"tag "))
+                        .is_some_and(|name| !name.is_empty()),
+                    "tag has no name"
+                );
+                Ok(vec![(id, kind)])
+            }
         }
     }
 }
@@ -180,8 +213,19 @@ pub fn reachable_since(
     tip: Oid,
     boundary: &HashSet<Oid>,
 ) -> Result<Vec<Oid>> {
+    reachable_many_since(store, &[tip], boundary)
+}
+pub fn reachable_many_since(
+    store: &mut impl ReadObjects,
+    tips: &[Oid],
+    boundary: &HashSet<Oid>,
+) -> Result<Vec<Oid>> {
+    ensure!(tips.len() <= MAX_OBJECTS, "too many object roots");
     let mut seen = HashSet::new();
-    let mut pending = vec![(tip, Kind::Commit)];
+    let mut pending = Vec::new();
+    for tip in tips.iter().copied().collect::<HashSet<_>>() {
+        pending.push((tip, store.get(tip)?.kind));
+    }
     let mut bytes = 0usize;
     while let Some((oid, expected)) = pending.pop() {
         if expected == Kind::Commit && boundary.contains(&oid) {

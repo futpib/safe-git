@@ -2,7 +2,7 @@
 name = "safe-git"
 version = "0.1.0"
 edition = "2024"
-description = "A deliberately restricted Git transfer client"
+description = "A Git client that treats repositories as untrusted data"
 license = "MIT"
 
 [dependencies]
@@ -18,8 +18,13 @@ url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
+diffy = "0.4"
+time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13"
 libtest-mimic = "0.8"
 rustix = { version = "1", features = ["process"] }
 shlex = "2"

@@ -2,8 +2,12 @@
 //! temporary sshd's forced command, keeping the entire fixture in Rust.
 #[path = "suites/bootstrap.rs"]
 mod bootstrap;
+#[path = "suites/http_packages.rs"]
+mod http_packages;
 #[path = "suites/output.rs"]
 mod output;
+#[path = "suites/packages.rs"]
+mod packages;
 #[path = "support/mod.rs"]
 mod support;
 #[path = "suites/transfers.rs"]
@@ -25,6 +29,14 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("http_packages", || {
+                http_packages::suite();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("packages", || {
+                packages::suite();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("bootstrap", || {
                 bootstrap::suite();
                 Ok(())

@@ -61,7 +61,7 @@ pub fn suite() {
     };
     let clone = |path: &std::path::Path| {
         hostile(fixture.safe(root))
-            .args(["clone", "--", &url])
+            .args(["clone", "--single-branch", "--", &url])
             .arg(path)
     };
     let safe = |args: &[&str]| hostile(fixture.safe(&work)).args(args);

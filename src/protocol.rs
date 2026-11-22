@@ -11,13 +11,13 @@ pub struct Advertisement {
     caps: HashSet<String>,
 }
 impl Advertisement {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             refs: HashMap::new(),
             caps: HashSet::new(),
         }
     }
-    fn line(&mut self, bytes: &[u8], first: bool) -> Result<()> {
+    pub(crate) fn line(&mut self, bytes: &[u8], first: bool) -> Result<()> {
         let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
         let line = if let Some(nul) = bytes.iter().position(|b| *b == 0) {
             ensure!(first, "capabilities after first advertisement");
@@ -150,6 +150,15 @@ pub async fn fetch(
         expected.is_none_or(|id| id == tip),
         "remote branch changed while preparing transfer; retry"
     );
+    let objects = transfer(wire, &ad, &[tip], haves).await?;
+    Ok((tip, objects))
+}
+
+pub(crate) fn request(ad: &Advertisement, tips: &[Oid], haves: &[Oid]) -> Result<Vec<u8>> {
+    ensure!(
+        !tips.is_empty() && tips.len() <= 100_000,
+        "invalid want count"
+    );
     let mut caps = String::new();
     for capability in ["ofs-delta", "no-progress"] {
         if ad.caps.contains(capability) {
@@ -157,33 +166,69 @@ pub async fn fetch(
             caps.push_str(capability);
         }
     }
-    let mut request = transport::packet(format!("want {tip}{caps}\n").as_bytes())?;
+    let mut request = Vec::new();
+    for (i, tip) in tips.iter().enumerate() {
+        let caps = if i == 0 { caps.as_str() } else { "" };
+        request.extend(transport::packet(format!("want {tip}{caps}\n").as_bytes())?);
+    }
     request.extend_from_slice(b"0000");
     ensure!(haves.len() <= 32, "too many negotiation tips");
     for have in haves {
         request.extend(transport::packet(format!("have {have}\n").as_bytes())?);
     }
     request.extend(transport::packet(b"done\n")?);
-    wire.send(request).await?;
+    Ok(request)
+}
+async fn transfer(
+    mut wire: Wire,
+    ad: &Advertisement,
+    tips: &[Oid],
+    haves: &[Oid],
+) -> Result<Objects> {
+    wire.send(request(ad, tips, haves)?).await?;
     wire.eof().await?;
     let response = wire
         .packet()
         .await?
         .context("missing negotiation response")?;
+    check_ack(&response, haves)?;
+    decode_pack(&wire.remainder().await?, haves)
+}
+pub(crate) fn check_ack(response: &[u8], haves: &[Oid]) -> Result<()> {
     if response != b"NAK\n" {
-        let acknowledged = response
+        let id = response
             .strip_prefix(b"ACK ")
             .and_then(|r| r.strip_suffix(b"\n"))
             .context("invalid negotiation response")?;
         ensure!(
-            haves.contains(&Oid::parse(acknowledged)?),
+            haves.contains(&Oid::parse(id)?),
             "server acknowledged an unoffered commit"
         );
     }
-    let bytes = wire.remainder().await?;
+    Ok(())
+}
+pub async fn fetch_many(
+    remote: &Remote,
+    auth: &Auth,
+    refs: &HashMap<String, Oid>,
+    haves: &[Oid],
+) -> Result<Objects> {
+    let mut wire = Wire::connect(remote, auth, false).await?;
+    let ad = advertise(&mut wire).await?;
+    for (name, id) in refs {
+        ensure!(
+            ad.refs.get(name) == Some(id),
+            "remote ref changed while fetching; retry"
+        );
+    }
+    let tips: HashSet<_> = refs.values().copied().collect();
+    transfer(wire, &ad, &tips.into_iter().collect::<Vec<_>>(), haves).await
+}
+
+pub(crate) fn decode_pack(bytes: &[u8], haves: &[Oid]) -> Result<Objects> {
     // Git can acknowledge another offered commit after initially acknowledging
     // the wanted tip, even without multi_ack. Only accept our exact offered IDs.
-    let mut rest = bytes.as_slice();
+    let mut rest = bytes;
     let mut extra = 0;
     while !rest.starts_with(b"PACK") {
         ensure!(
@@ -210,7 +255,7 @@ pub async fn fetch(
         );
         rest = &rest[size..];
     }
-    Ok((tip, pack::decode(rest)?))
+    pack::decode(rest)
 }
 
 /// Read refs without requesting objects or running a local helper.

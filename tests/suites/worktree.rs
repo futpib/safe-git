@@ -313,4 +313,58 @@ pub fn suite() {
     assert!(!txn.exists() && !work.join(".git/index.lock").exists());
     assert!(git(&work).args(["status", "--porcelain"]).run().is_empty());
     passed("SIGKILL mid-checkout preserves backups; recover restores files, index, and locks");
+    for operation in ["reset-same", "switch-existing"] {
+        let work = clone();
+        let command = if operation == "reset-same" {
+            for i in 0..300 {
+                write(
+                    work.join(format!("bulk-{i:03}")),
+                    "user edit before reset\n",
+                );
+            }
+            vec!["reset", "--hard", "HEAD"]
+        } else {
+            git(&work).args(["branch", "target", &forward]).run();
+            vec!["checkout", "--force", "target"]
+        };
+        let original = read(work.join("bulk-000"));
+        let original_index = fs::read(work.join(".git/index")).unwrap();
+        let mut process = fixture.safe(&work).args(&command).spawn();
+        let txn = work.join(".git/safe-git-checkout");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if txn.join("old-0").exists() {
+                process.signal(rustix::process::Signal::STOP);
+                break;
+            }
+            assert!(
+                process.child.try_wait().unwrap().is_none(),
+                "operation completed before interruption"
+            );
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_micros(500));
+        }
+        process.signal(rustix::process::Signal::KILL);
+        process.child.wait().unwrap();
+        fixture.safe(&work).arg("recover").run();
+        assert_eq!(read(work.join("bulk-000")), original);
+        assert_eq!(fs::read(work.join(".git/index")).unwrap(), original_index);
+        assert_eq!(head(&work), base);
+        assert_eq!(
+            git(&work).args(["symbolic-ref", "HEAD"]).run(),
+            "refs/heads/main"
+        );
+        assert!(!work.join(".git/HEAD.lock").exists());
+        assert!(!txn.exists());
+        fixture.safe(&work).args(&command).run();
+        if operation == "reset-same" {
+            assert_eq!(read(work.join("bulk-000")), "old\n");
+        } else {
+            assert_eq!(revision(&work, "HEAD"), forward);
+            assert_eq!(head(&work), base);
+        }
+    }
+    passed(
+        "interrupted equal-tip hard reset and branch switch roll back files/index/HEAD and release locks",
+    );
 }

@@ -47,7 +47,12 @@ pub fn tree(store: &mut impl ReadObjects, commit: Option<Oid>) -> Result<Entries
     let Some(commit) = commit else {
         return Ok(entries);
     };
-    let (root, _) = store.get(commit)?.commit()?;
+    let object = store.get(commit)?;
+    let root = if object.kind == Kind::Tree {
+        commit
+    } else {
+        object.commit()?.0
+    };
     let mut pending = vec![(Vec::new(), root, 0usize)];
     let mut visited = 0;
     while let Some((prefix, oid, depth)) = pending.pop() {

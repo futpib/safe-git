@@ -66,7 +66,7 @@ pub fn pull_fetch(url: &str, branch: &str) -> String {
     format!("From {url}\n * branch            {branch:10} -> FETCH_HEAD\n")
 }
 
-fn quote(path: &[u8]) -> String {
+pub(crate) fn quote(path: &[u8]) -> String {
     if path
         .iter()
         .all(|b| (32..127).contains(b) && !b"\"\\".contains(b))
@@ -147,7 +147,7 @@ struct Stat {
     binary: bool,
 }
 
-fn content(
+pub(crate) fn content(
     store: &mut impl ReadObjects,
     entry: Option<Entry>,
     budget: &mut usize,
@@ -168,6 +168,13 @@ fn content(
 pub fn diffstat(store: &mut impl ReadObjects, old: Option<Oid>, new: Oid) -> Result<String> {
     let old_tree = index::tree(store, old)?;
     let new_tree = index::tree(store, Some(new))?;
+    diffstat_entries(store, &old_tree, &new_tree)
+}
+pub(crate) fn diffstat_entries(
+    store: &mut impl ReadObjects,
+    old_tree: &index::Entries,
+    new_tree: &index::Entries,
+) -> Result<String> {
     let paths: BTreeSet<_> = old_tree.keys().chain(new_tree.keys()).collect();
     let mut bytes = 16 * 1024 * 1024;
     let mut comparisons = 8_000_000;
