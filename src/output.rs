@@ -60,6 +60,12 @@ pub fn push(url: &str, local: &str, remote: &str, old: Option<Oid>, new: Oid) ->
     format!("To {url}\n {flag} {summary:17} {local} -> {remote}\n")
 }
 
+pub fn pull_fetch(url: &str, branch: &str) -> String {
+    let url = url.trim_end_matches('/');
+    let url = display_url(url.strip_suffix(".git").unwrap_or(url));
+    format!("From {url}\n * branch            {branch:10} -> FETCH_HEAD\n")
+}
+
 fn quote(path: &[u8]) -> String {
     if path
         .iter()

@@ -1,5 +1,7 @@
 //! Real Git/OpenSSH interoperability tests. This executable also serves as the
 //! temporary sshd's forced command, keeping the entire fixture in Rust.
+#[path = "suites/bootstrap.rs"]
+mod bootstrap;
 #[path = "suites/output.rs"]
 mod output;
 #[path = "support/mod.rs"]
@@ -23,6 +25,10 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("bootstrap", || {
+                bootstrap::suite();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("transfers", || {
                 transfers::suite();
                 Ok(())

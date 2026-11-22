@@ -1,0 +1,6 @@
+rule clone-futpib(x: repository-name) {
+  require is-directory "~/code"
+  create-new-directory "~/code/${x}" as dest {
+    run /usr/bin/safe-git clone --single-branch -- "git@github.com:futpib/${x}.git" "${dest}"
+  }
+}

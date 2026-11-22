@@ -1,4 +1,5 @@
 mod checkout;
+mod clone;
 mod index;
 mod object;
 mod output;
@@ -10,7 +11,7 @@ mod transport;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use object::{ReadObjects, ancestor, commits, reachable, reachable_since};
+use object::{Oid, ReadObjects, ancestor, commits, reachable, reachable_since};
 use repo::{Repo, Store};
 use std::{path::PathBuf, time::Duration};
 use transport::{Auth, Remote};
@@ -18,7 +19,7 @@ use transport::{Auth, Remote};
 #[derive(Parser)]
 #[command(
     version,
-    about = "Restricted fetch, fast-forward merge, and push over SSH"
+    about = "Inert SSH clone, fetch, fast-forward pull/merge, and push"
 )]
 struct Cli {
     /// Working-tree root or bare repository; never discovers parent repositories
@@ -35,7 +36,7 @@ struct Cli {
     /// Use only SSH_AUTH_SOCK instead of also trying default keys; never forward it
     #[arg(long, global = true, env = "SAFE_GIT_SSH_AGENT")]
     ssh_agent: bool,
-    /// Caller-selected endpoint for fetch/push without a positional URL
+    /// Caller-selected endpoint for fetch/pull/push without a positional URL
     #[arg(long = "url", global = true, env = "SAFE_GIT_URL")]
     remote_url: Option<String>,
     /// Trusted host-key file (defaults to ~/.ssh/known_hosts)
@@ -52,6 +53,17 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Clone one branch into a new or empty ordinary working tree
+    Clone {
+        /// Select a branch instead of the remote's advertised default
+        #[arg(short, long)]
+        branch: Option<String>,
+        /// All safe-git clones fetch only the selected branch
+        #[arg(long)]
+        single_branch: bool,
+        url: String,
+        path: PathBuf,
+    },
     /// Create a new bare SHA-1 repository
     Init {
         #[arg(long, required = true)]
@@ -67,6 +79,19 @@ enum Command {
         /// Storage label only; never resolves a configured remote
         #[arg(long, default_value = "origin")]
         remote: String,
+    },
+    /// Fetch one branch and fast-forward under one repository lock
+    Pull {
+        #[arg(long, required = true)]
+        ff_only: bool,
+        /// Submodules are always inert; accepted for Git command compatibility
+        #[arg(long)]
+        no_recurse_submodules: bool,
+        #[arg(long)]
+        no_stat: bool,
+        url: Option<String>,
+        /// Defaults to the current branch; repository upstream config is ignored
+        branch: Option<String>,
     },
     /// Fast-forward the current branch and update its working tree, if present
     Merge {
@@ -110,6 +135,20 @@ impl Cli {
 }
 
 async fn run(cli: &Cli) -> Result<()> {
+    if let Command::Clone {
+        url, path, branch, ..
+    } = &cli.command
+    {
+        return clone::run(
+            &cli.repository.join(path),
+            path,
+            url,
+            &cli.auth()?,
+            branch.as_deref(),
+            cli.quiet,
+        )
+        .await;
+    }
     if let Command::Init {
         path,
         initial_branch,
@@ -139,60 +178,40 @@ async fn run(cli: &Cli) -> Result<()> {
     );
     let mut store = Store::new(&repo);
     match &cli.command {
-        Command::Init { .. } | Command::Recover => unreachable!(),
+        Command::Clone { .. } | Command::Init { .. } | Command::Recover => unreachable!(),
         Command::Fetch {
             url,
             branch,
             remote,
         } => {
-            let head = repo.head()?;
-            let branch = repo::branch(
-                branch
-                    .as_deref()
-                    .unwrap_or(head.strip_prefix("refs/heads/").context("invalid HEAD")?),
-            )?;
-            let reference = repo::tracking(remote, &branch)?;
-            let old = repo.read_ref(&reference)?;
-            let mut haves = Vec::new();
-            for id in [old, repo.read_ref(&repo.head()?)?].into_iter().flatten() {
-                if !haves.contains(&id) {
-                    store.get(id)?.commit()?;
-                    haves.push(id);
-                }
-            }
-            let boundary = commits(&mut store, &haves)?;
-            let (tip, objects) = protocol::fetch(
-                &cli.endpoint(url.as_deref())?,
-                &cli.auth()?,
-                &branch,
-                None,
-                &haves,
+            fetch(
+                cli,
+                &repo,
+                &mut store,
+                url.as_deref(),
+                branch.as_deref(),
+                Some(remote),
             )
             .await?;
-            store.add(objects)?;
-            store.get(tip)?.commit()?;
-            let ids = reachable_since(&mut store, tip, &boundary)?;
-            for id in ids {
-                repo.write_object(store.get(id)?.as_ref())?;
-            }
-            let fast_forward = match old {
-                Some(old) if old != tip => ancestor(&mut store, old, tip)?,
-                _ => true,
-            };
-            repo.update_ref(&reference, old, tip)?;
-            if !cli.quiet {
-                eprint!(
-                    "{}",
-                    output::fetch(
-                        cli.url(url.as_deref())?,
-                        &branch,
-                        remote,
-                        old,
-                        tip,
-                        fast_forward
-                    )
-                );
-            }
+        }
+        Command::Pull {
+            url,
+            branch,
+            no_stat,
+            ..
+        } => {
+            let head = repo.head()?;
+            let incoming = fetch(
+                cli,
+                &repo,
+                &mut store,
+                url.as_deref(),
+                branch.as_deref(),
+                None,
+            )
+            .await?;
+            ensure!(repo.head()? == head, "HEAD changed during pull; retry");
+            merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;
         }
         Command::Merge {
             reference, no_stat, ..
@@ -210,58 +229,7 @@ async fn run(cli: &Cli) -> Result<()> {
             let incoming = repo
                 .read_ref(&reference)?
                 .context("tracking ref does not exist; fetch first")?;
-            let head = repo.head()?;
-            let current = repo.read_ref(&head)?;
-            store.get(incoming)?.commit()?;
-            if let Some(current) = current {
-                store.get(current)?.commit()?;
-                if current == incoming {
-                    if !cli.quiet {
-                        println!("Already up to date.");
-                    }
-                    return Ok(());
-                }
-                if !ancestor(&mut store, current, incoming)? {
-                    if ancestor(&mut store, incoming, current)? {
-                        if !cli.quiet {
-                            println!("Already up to date.");
-                        }
-                        return Ok(());
-                    }
-                    anyhow::bail!("Not possible to fast-forward, aborting.");
-                }
-            }
-            // Re-check HEAD as well as using the branch's normal compare-and-swap lock.
-            ensure!(repo.head()? == head, "HEAD changed concurrently; retry");
-            let stat = if !cli.quiet && !no_stat && current.is_some() {
-                Some(output::diffstat(&mut store, current, incoming))
-            } else {
-                None
-            };
-            if repo.worktree.is_some() {
-                checkout::merge(&repo, &mut store, &head, current, incoming)?;
-            } else {
-                reachable(&mut store, incoming)?;
-                repo.update_ref(&head, current, incoming)?;
-            }
-            if !cli.quiet {
-                if let Some(current) = current {
-                    println!(
-                        "Updating {}..{}\nFast-forward",
-                        output::short(current),
-                        output::short(incoming)
-                    );
-                }
-                if let Some(stat) = stat {
-                    match stat {
-                        Ok(stat) => print!("{stat}"),
-                        Err(e) => eprintln!(
-                            "warning: safe-git: diffstat omitted ({})",
-                            format!("{e:#}").escape_debug()
-                        ),
-                    }
-                }
-            }
+            merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;
         }
         Command::Push { url, refspec } => {
             let head = repo.head()?;
@@ -322,6 +290,127 @@ async fn run(cli: &Cli) -> Result<()> {
                     "{}",
                     output::push(cli.url(url.as_deref())?, &local, &dest, destination, tip)
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn fetch(
+    cli: &Cli,
+    repo: &Repo,
+    store: &mut Store<'_>,
+    url: Option<&str>,
+    branch: Option<&str>,
+    remote: Option<&str>,
+) -> Result<Oid> {
+    let head = repo.head()?;
+    let branch =
+        repo::branch(branch.unwrap_or(head.strip_prefix("refs/heads/").context("invalid HEAD")?))?;
+    let reference = remote
+        .map(|remote| repo::tracking(remote, &branch))
+        .transpose()?;
+    let old = match &reference {
+        Some(reference) => repo.read_ref(reference)?,
+        None => None,
+    };
+    let mut haves = Vec::new();
+    for id in [old, repo.read_ref(&repo.head()?)?].into_iter().flatten() {
+        if !haves.contains(&id) {
+            store.get(id)?.commit()?;
+            haves.push(id);
+        }
+    }
+    let boundary = commits(store, &haves)?;
+    let (tip, objects) =
+        protocol::fetch(&cli.endpoint(url)?, &cli.auth()?, &branch, None, &haves).await?;
+    store.add(objects)?;
+    store.get(tip)?.commit()?;
+    let ids = reachable_since(store, tip, &boundary)?;
+    for id in ids {
+        repo.write_object(store.get(id)?.as_ref())?;
+    }
+    let fast_forward = match old {
+        Some(old) if old != tip => ancestor(store, old, tip)?,
+        _ => true,
+    };
+    if let Some(reference) = reference {
+        repo.update_ref(&reference, old, tip)?;
+    } else {
+        repo.atomic(
+            "FETCH_HEAD",
+            format!("{tip}\t\tbranch '{branch}' of {}\n", cli.url(url)?).as_bytes(),
+        )?;
+    }
+    if !cli.quiet {
+        if let Some(remote) = remote {
+            eprint!(
+                "{}",
+                output::fetch(cli.url(url)?, &branch, remote, old, tip, fast_forward)
+            );
+        } else {
+            eprint!("{}", output::pull_fetch(cli.url(url)?, &branch));
+        }
+    }
+    Ok(tip)
+}
+
+fn merge(
+    repo: &Repo,
+    store: &mut Store<'_>,
+    incoming: Oid,
+    quiet: bool,
+    no_stat: bool,
+) -> Result<()> {
+    let head = repo.head()?;
+    let current = repo.read_ref(&head)?;
+    store.get(incoming)?.commit()?;
+    if let Some(current) = current {
+        store.get(current)?.commit()?;
+        if current == incoming {
+            if !quiet {
+                println!("Already up to date.");
+            }
+            return Ok(());
+        }
+        if !ancestor(store, current, incoming)? {
+            if ancestor(store, incoming, current)? {
+                if !quiet {
+                    println!("Already up to date.");
+                }
+                return Ok(());
+            }
+            anyhow::bail!("Not possible to fast-forward, aborting.");
+        }
+    }
+    // Re-check HEAD as well as using the branch's normal compare-and-swap lock.
+    ensure!(repo.head()? == head, "HEAD changed concurrently; retry");
+    let stat = if !quiet && !no_stat && current.is_some() {
+        Some(output::diffstat(store, current, incoming))
+    } else {
+        None
+    };
+    if repo.worktree.is_some() {
+        checkout::merge(repo, store, &head, current, incoming)?;
+    } else {
+        reachable(store, incoming)?;
+        repo.update_ref(&head, current, incoming)?;
+    }
+    if !quiet {
+        if let Some(current) = current {
+            println!(
+                "Updating {}..{}\nFast-forward",
+                output::short(current),
+                output::short(incoming)
+            );
+        }
+        if let Some(stat) = stat {
+            match stat {
+                Ok(stat) => print!("{stat}"),
+                Err(e) => eprintln!(
+                    "warning: safe-git: diffstat omitted ({})",
+                    format!("{e:#}").escape_debug()
+                ),
             }
         }
     }

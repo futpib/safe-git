@@ -88,13 +88,28 @@ impl Repo {
         std::fs::create_dir(path).context("init requires a new directory")?;
         let root = File::from(fs::open(path, DIR, Mode::empty())?);
         let repo = Self::lock(root)?;
+        repo.initialize(&initial, true)
+    }
+    /// Initialize metadata inside a private, empty clone staging directory.
+    pub fn init_worktree(path: &Path, initial: &str) -> Result<Self> {
+        let initial = branch(initial)?;
+        let worktree = File::from(fs::open(path, DIR, Mode::empty())?);
+        fs::mkdirat(&worktree, ".git", Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
+        let root = File::from(fs::openat(&worktree, ".git", DIR, Mode::empty())?);
+        let mut repo = Self::lock(root)?;
+        repo.worktree = Some(worktree);
+        repo.initialize(&initial, false)?;
+        Ok(repo)
+    }
+    fn initialize(&self, initial: &str, bare: bool) -> Result<()> {
+        let repo = self;
         repo.parent("objects/info/.placeholder", true)?;
         repo.parent("objects/pack/.placeholder", true)?;
         repo.parent("refs/heads/.placeholder", true)?;
         repo.parent("refs/remotes/.placeholder", true)?;
         repo.atomic(
             "config",
-            b"[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+            format!("[core]\n\trepositoryformatversion = 0\n\tbare = {bare}\n").as_bytes(),
         )?;
         repo.atomic("HEAD", format!("ref: refs/heads/{initial}\n").as_bytes())?;
         Ok(())

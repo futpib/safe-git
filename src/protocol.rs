@@ -66,6 +66,57 @@ impl Advertisement {
     pub fn branch(&self, name: &str) -> Option<Oid> {
         self.refs.get(&format!("refs/heads/{name}")).copied()
     }
+    pub fn clone_branch(&self, requested: Option<&str>) -> Result<(String, Option<Oid>)> {
+        if let Some(name) = requested {
+            let name = repo::branch(name)?;
+            let tip = self.branch(&name).context("remote branch does not exist")?;
+            return Ok((name, Some(tip)));
+        }
+        let mut targets = self
+            .caps
+            .iter()
+            .filter_map(|cap| cap.strip_prefix("symref=HEAD:"));
+        let target = targets.next();
+        ensure!(targets.next().is_none(), "conflicting remote HEAD targets");
+        if let Some(target) = target {
+            let name = repo::branch(
+                target
+                    .strip_prefix("refs/heads/")
+                    .context("remote HEAD must name a branch")?,
+            )?;
+            let tip = self.branch(&name);
+            ensure!(
+                tip.is_some() || self.refs.is_empty(),
+                "remote HEAD names a missing branch"
+            );
+            ensure!(
+                self.refs.get("HEAD").is_none_or(|id| Some(*id) == tip),
+                "remote HEAD disagrees with its branch"
+            );
+            return Ok((name, tip));
+        }
+        if self.refs.is_empty() {
+            // Protocol v0 cannot advertise the unborn HEAD of an empty repo.
+            return Ok(("master".to_owned(), None));
+        }
+        let head = self
+            .refs
+            .get("HEAD")
+            .context("remote HEAD is missing; select --branch")?;
+        let mut names = self.refs.iter().filter_map(|(name, id)| {
+            (id == head)
+                .then(|| name.strip_prefix("refs/heads/"))
+                .flatten()
+        });
+        let name = names
+            .next()
+            .context("remote HEAD is detached; select --branch")?;
+        ensure!(
+            names.next().is_none(),
+            "remote HEAD is ambiguous; select --branch"
+        );
+        Ok((repo::branch(name)?, Some(*head)))
+    }
 }
 pub async fn advertise(wire: &mut Wire) -> Result<Advertisement> {
     let mut ad = Advertisement::new();
@@ -97,7 +148,7 @@ pub async fn fetch(
     let tip = ad.branch(branch).context("remote branch does not exist")?;
     ensure!(
         expected.is_none_or(|id| id == tip),
-        "remote branch changed while preparing push; retry"
+        "remote branch changed while preparing transfer; retry"
     );
     let mut caps = String::new();
     for capability in ["ofs-delta", "no-progress"] {
@@ -160,6 +211,19 @@ pub async fn fetch(
         rest = &rest[size..];
     }
     Ok((tip, pack::decode(rest)?))
+}
+
+/// Read refs without requesting objects or running a local helper.
+pub async fn discover(remote: &Remote, auth: &Auth) -> Result<Advertisement> {
+    let mut wire = Wire::connect(remote, auth, false).await?;
+    let ad = advertise(&mut wire).await?;
+    wire.send(b"0000".to_vec()).await?;
+    wire.eof().await?;
+    ensure!(
+        wire.remainder().await?.is_empty(),
+        "unexpected response to ref discovery"
+    );
+    Ok(ad)
 }
 
 pub struct Push {
@@ -232,6 +296,49 @@ impl Push {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clone_head_selection_validates_symrefs_and_ambiguity() {
+        let mut ad = Advertisement::new();
+        assert_eq!(ad.clone_branch(None).unwrap(), ("master".into(), None));
+        assert!(ad.clone_branch(Some("missing")).is_err());
+        ad.line(
+            b"1111111111111111111111111111111111111111 HEAD\0symref=HEAD:refs/heads/master\n",
+            true,
+        )
+        .unwrap();
+        assert!(ad.clone_branch(None).is_err());
+        for name in ["master", "other"] {
+            ad.line(
+                format!("1111111111111111111111111111111111111111 refs/heads/{name}\n").as_bytes(),
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(ad.clone_branch(None).unwrap().0, "master");
+        assert_eq!(ad.clone_branch(Some("other")).unwrap().0, "other");
+        ad.caps.insert("symref=HEAD:refs/heads/other".into());
+        assert!(ad.clone_branch(None).is_err());
+        ad.caps.clear();
+        assert!(ad.clone_branch(None).is_err());
+        ad.refs.remove("refs/heads/other");
+        assert_eq!(ad.clone_branch(None).unwrap().0, "master");
+        for target in [
+            "refs/tags/tag",
+            "refs/heads/../escape",
+            "refs/heads/missing",
+        ] {
+            ad.caps.clear();
+            ad.caps.insert(format!("symref=HEAD:{target}"));
+            assert!(ad.clone_branch(None).is_err());
+        }
+        ad.caps.clear();
+        ad.caps.insert("symref=HEAD:refs/heads/master".into());
+        ad.refs.insert(
+            "HEAD".into(),
+            Oid::parse(b"2222222222222222222222222222222222222222").unwrap(),
+        );
+        assert!(ad.clone_branch(None).is_err());
+    }
     #[test]
     fn advertisement_validation() {
         let mut ad = Advertisement::new();

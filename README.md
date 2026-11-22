@@ -1,8 +1,8 @@
 # safe-git
 
 A Git CLI that **does not trust the repository it works on**. Its purpose is to
-fetch, fast-forward, and push without executing anything an attacker puts in the
-repository.
+clone, fetch, fast-forward, and push without executing anything an attacker puts
+in the repository.
 
 Git and SSH are implemented in-process in Rust. There is no shell, subprocess,
 or fallback to Git. Hooks, filters, command aliases, credential helpers, and

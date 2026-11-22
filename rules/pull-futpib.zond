@@ -1,0 +1,5 @@
+rule pull-futpib(x: repository-name) {
+  require is-directory "~/code/${x}"
+  require is-directory "~/code/${x}/.git"
+  run /usr/bin/safe-git -C "~/code/${x}" pull --ff-only --no-recurse-submodules -- "git@github.com:futpib/${x}.git"
+}
