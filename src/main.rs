@@ -18,7 +18,7 @@ use transport::{Auth, Remote};
 
 #[derive(Parser)]
 #[command(
-    version,
+    version = env!("SAFE_GIT_VERSION"),
     about = "Inert SSH clone, fetch, fast-forward pull/merge, and push"
 )]
 struct Cli {
