@@ -19,7 +19,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+libtest-mimic = "0.8"
+rustix = { version = "1", features = ["process"] }
+shlex = "2"
 tempfile = "3"
+
+[[test]]
+name = "integration"
+# The test executable also implements sshd's forced-command fixture.
+harness = false
 
 [profile.release]
 overflow-checks = true

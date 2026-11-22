@@ -207,15 +207,20 @@ or other programs if you subsequently choose to run those programs against them.
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-cargo build --locked
-python3 tests/integration.py
-python3 tests/worktree.py
-python3 tests/output.py
 ```
 
-The suites require Git, Python, OpenSSH tools, and passwordless sudo for a
-loopback-only temporary sshd (or root). Temporary repositories and generated keys
-are removed afterward. With `strace`, they verify no child executable is launched
+`cargo test` builds the client and runs the unit tests plus all three Rust
+end-to-end suites: `transfers`, `worktree`, and `output`. Run one suite with
+`cargo test --locked --test integration worktree`, or only the unit tests with
+`cargo test --locked --bin safe-git`.
+
+The end-to-end suites require Git, OpenSSH tools (`ssh`, `sshd`, `ssh-keygen`,
+`ssh-agent`, and `ssh-add`), and passwordless sudo for a loopback-only temporary
+sshd (or root). The Rust test executable also provides the server-side protocol
+fixture; Python is not required. Each suite uses its own temporary repositories,
+keys, port, and child-process environment, so the suites can run concurrently.
+Servers and agents are stopped and temporary files removed afterward, including
+on test failure. With `strace`, the suites verify no child executable is launched
 by fetch, working-tree/bare merge, or push.
 
 Coverage includes real Git interoperability, packed refs and both delta forms,
