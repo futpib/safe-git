@@ -47,8 +47,15 @@ impl Advertisement {
             return Ok(());
         }
         ensure!(id != Oid::ZERO, "zero object ID in advertised ref");
+        // receive-pack advertises objects from shared storage / other namespaces
+        // as repeatable .have hints. They are not refs and never select a branch.
+        // We do not use these optional hints to omit objects from a push.
+        if name == ".have" {
+            return Ok(());
+        }
         if name != "HEAD" {
-            repo::refname(name.strip_suffix("^{}").unwrap_or(name))?;
+            repo::refname(name.strip_suffix("^{}").unwrap_or(name))
+                .with_context(|| format!("invalid advertised ref {name}"))?;
         }
         ensure!(
             self.refs.insert(name.to_owned(), id).is_none(),
@@ -213,10 +220,11 @@ impl Push {
             self.wire.packet().await?.is_none(),
             "unexpected extra ref status"
         );
-        ensure!(
-            self.wire.remainder().await?.is_empty(),
-            "unexpected bytes after push status"
-        );
+        // The flush terminates report-status, as in Git's receive_status().
+        // Later server output cannot change the acknowledged result. Drain it
+        // under the transport bounds without displaying or interpreting it,
+        // and still require a successful SSH service exit.
+        self.wire.remainder().await?;
         Ok(())
     }
 }
@@ -243,6 +251,42 @@ mod tests {
             &b"1111111111111111111111111111111111111111 HEAD\0object-format=sha256"[..],
         ] {
             assert!(Advertisement::new().line(bad, true).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_object_hints_are_not_refs() {
+        let mut ad = Advertisement::new();
+        ad.line(
+            b"1111111111111111111111111111111111111111 .have\0report-status\n",
+            true,
+        )
+        .unwrap();
+        ad.line(b"2222222222222222222222222222222222222222 .have\n", false)
+            .unwrap();
+        ad.line(b"1111111111111111111111111111111111111111 .have\n", false)
+            .unwrap();
+        assert!(ad.refs.is_empty());
+        assert!(ad.caps.contains("report-status"));
+        assert!(ad.branch(".have").is_none());
+        ad.line(
+            b"3333333333333333333333333333333333333333 refs/heads/main\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(ad.refs.len(), 1);
+        assert_eq!(
+            ad.branch("main"),
+            Some(Oid::parse(b"3333333333333333333333333333333333333333").unwrap())
+        );
+        for bad in [
+            &b"0000000000000000000000000000000000000000 .have\n"[..],
+            &b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx .have\n"[..],
+            &b"1111111111111111111111111111111111111111 .have/../main\n"[..],
+            &b"1111111111111111111111111111111111111111 .have^{}\n"[..],
+            &b"1111111111111111111111111111111111111111 .have\0report-status\n"[..],
+        ] {
+            assert!(Advertisement::new().line(bad, false).is_err());
         }
     }
 }

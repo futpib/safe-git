@@ -114,6 +114,11 @@ Intentional output differences:
 - Repository/global output configuration, attributes, diff drivers, textconv,
   colors, translations, and pagers are not evaluated. No remote progress stream
   is printed; protocol validation failures use escaped diagnostics.
+- Push checks the unpack result, the exact branch acknowledgement, the report
+  terminator, and the SSH service exit. Output after the completed status report
+  is drained within transport limits and discarded, as it cannot change the
+  acknowledged result. Optional `.have` shared-object advertisements are ignored;
+  they are never treated as branches or used to skip required object validation.
 - Diffstat uses raw blobs, a fixed 80-column layout, seven-character commit IDs,
   and a bounded exact line edit count. Rename/copy detection and Git's heuristic
   diff optimizations are absent, so some statistics differ. Git's custom

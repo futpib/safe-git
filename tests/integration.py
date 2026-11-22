@@ -100,6 +100,12 @@ def suite(root, port, user):
     for path in (source, dest):
         git(root, "clone", "-q", "--bare", seed, path)
     git(dest, "update-ref", "-d", "refs/heads/forward")
+    git(dest, "update-ref", "-d", "refs/heads/side")
+    # Fork hosts can share storage and advertise non-ref .have object hints.
+    # Exercise real receive-pack output throughout the push/race/refusal cases.
+    (dest / "objects/info/alternates").write_text(str(seed / ".git/objects") + "\n")
+    advertisement = git(root, "receive-pack", "--advertise-refs", dest)
+    assert advertisement.count(" .have") >= 2, advertisement
     safe("init", "--bare", relay)
     safe("fetch", url(source), "main")
     assert not (relay / "refs/heads/main").exists()
@@ -149,7 +155,7 @@ def suite(root, port, user):
             assert len(executions) == 1 and str(BIN) in executions[0], executions
     assert ref(relay) == ref(dest) == forward and not marker.exists()
     assert git(dest, "show-ref", "--verify", "refs/heads/forward", ok=False)
-    passed("fetch/merge/push; hostile config, hooks, environment, tracked scripts inert; no child exec")
+    passed("fetch/merge/push with shared-object hints; hostile config and hooks inert; no child exec")
 
     safe("merge", "--ff-only", "origin/main")
     safe("push", url(dest))
@@ -191,6 +197,32 @@ def suite(root, port, user):
     assert ref(dest) == forward
     reject.unlink()
     passed("server hook rejection is reported as failure")
+
+    trailer = root / "push-trailer"
+    oracle = root / "oracle.git"
+    git(root, "clone", "-q", "--bare", seed, oracle)
+    git(oracle, "update-ref", "refs/heads/main", joined)
+    ssh_command = shlex.join(["ssh", "-F", "/dev/null", "-i", str(key),
+                              "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                              "-o", f"UserKnownHostsFile={known}",
+                              "-o", "StrictHostKeyChecking=yes"])
+    for tail in (b"0000", b"trailing server diagnostics\n"):
+        trailer.write_bytes(tail)
+        for push in (lambda: safe("push", url(dest)),
+                     lambda: git(oracle, "push", url(dest), "main:main",
+                                 env=ENV | {"GIT_SSH_COMMAND": ssh_command})):
+            git(dest, "update-ref", "refs/heads/main", forward)
+            push()
+            assert ref(dest) == joined
+    trailer.write_bytes(b"0017ok refs/heads/main\n0000")
+    git(dest, "update-ref", "refs/heads/main", forward)
+    reject.write_text("#!/bin/sh\nexit 1\n")
+    reject.chmod(0o700)
+    assert "rejected" in safe("push", url(dest), ok=False)
+    assert ref(dest) == forward
+    reject.unlink()
+    trailer.unlink()
+    passed("completed push report ignores trailers like Git; trailers cannot override rejection")
 
     # Exercise both Git pack delta encodings independently of upload-pack.
     for flag in ("--delta-base-offset", "--no-delta-base-offset"):
@@ -396,6 +428,23 @@ if (root / "malformed").exists():
     sys.stdout.buffer.write(pkt(b"NAK\\n") + pack)
     sys.exit(0)
 command = ["/usr/bin/git", args[0][4:], args[1]]
+if args[0] == "git-receive-pack" and (root / "push-trailer").exists():
+    child = subprocess.Popen(command, stdin=sys.stdin.buffer, stdout=subprocess.PIPE)
+    while True:
+        header = child.stdout.read(4)
+        size = int(header, 16)
+        sys.stdout.buffer.write(header)
+        if not size:
+            break
+        sys.stdout.buffer.write(child.stdout.read(size - 4))
+    sys.stdout.buffer.flush()
+    response = child.stdout.read()
+    sys.stdout.buffer.write(response)
+    # A preliminary ref check sends no commands and has no status report.
+    if response:
+        sys.stdout.buffer.write((root / "push-trailer").read_bytes())
+    sys.stdout.buffer.flush()
+    sys.exit(child.wait())
 if args[0] == "git-receive-pack" and args[1] == str(root / "dest.git") and (root / "race").exists():
     counter = root / "race-count"
     seen = int(counter.read_text()) if counter.exists() else 0
