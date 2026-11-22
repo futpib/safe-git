@@ -266,6 +266,61 @@ def suite(root, port, user):
     passed("hashed known_hosts entries accepted")
     run([BIN, "-C", relay, "--identity-file", root / "host_key", "--known-hosts", known,
          "fetch", url(source), "main"], ok=False)
+
+    home = root / "home"
+    ssh = home / ".ssh"
+    ssh.mkdir(parents=True)
+    shutil.copy(known, ssh / "known_hosts")
+    auto_env = {k: v for k, v in hostile_env.items()
+                if not k.startswith("SAFE_GIT_") and k != "SSH_AUTH_SOCK"}
+    auto_env["HOME"] = str(home)
+    automatic = [BIN, "-C", relay, "--timeout", "20"]
+
+    def auto_fetch(*options, env=None, ok=True):
+        return run([*automatic, *options, "fetch", url(source), "main"],
+                   env=env or auto_env, ok=ok)
+
+    assert "SSH authentication failed" in auto_fetch(ok=False)
+    authorized = root / "authorized_keys"
+    for algorithm in ("ed25519", "ecdsa", "rsa"):
+        default = ssh / f"id_{algorithm}"
+        run(["ssh-keygen", "-q", "-t", algorithm, "-N", "", "-f", default])
+        with authorized.open("a") as f:
+            f.write("restrict " + default.with_suffix(".pub").read_text())
+        auto_fetch()
+        run([*automatic, "push", url(dest)], env=auto_env)
+        default.unlink()
+    passed("default Ed25519, ECDSA, RSA keys and known_hosts authenticate fetch and push")
+
+    default = ssh / "id_ed25519"
+    shutil.copy(key, default)
+    stale_env = auto_env | {"SSH_AUTH_SOCK": str(root / "missing-agent.sock")}
+    auto_fetch(env=stale_env)
+    assert "connect SSH_AUTH_SOCK" in auto_fetch("--ssh-agent", env=stale_env, ok=False)
+    auto_fetch("--identity-file", root / "host_key", ok=False)
+    auto_fetch(env=auto_env | {"SAFE_GIT_IDENTITY_FILE": str(root / "host_key")}, ok=False)
+    passed("unavailable automatic agent falls back; explicit key or agent never falls back")
+
+    fallback = ssh / "id_rsa"
+    shutil.copy(key, fallback)
+    run(["ssh-keygen", "-p", "-P", "", "-N", "test-passphrase", "-f", default])
+    auto_fetch()
+    default.write_text("not a key\n")
+    auto_fetch()
+    fallback.unlink()
+    assert "SSH authentication failed" in auto_fetch(ok=False)
+    shutil.copy(key, default)
+    passed("unusable default keys are skipped and absent usable credentials fail")
+
+    (ssh / "known_hosts").write_text("")
+    auto_fetch(ok=False)
+    shutil.copy(known, ssh / "known_hosts")
+    run([*tracing, *automatic, "fetch", url(source), "main"], env=auto_env)
+    if tracing:
+        executions = [line for line in trace.read_text().splitlines() if "execve" in line]
+        assert len(executions) == 1 and str(BIN) in executions[0], executions
+    passed("default host-key verification remains required; automatic auth runs no children")
+
     agent_socket = root / "agent.sock"
     agent = subprocess.Popen(["ssh-agent", "-D", "-a", str(agent_socket)],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -274,8 +329,20 @@ def suite(root, port, user):
             if agent_socket.exists():
                 break
             time.sleep(0.01)
-        agent_env = hostile_env | {"SSH_AUTH_SOCK": str(agent_socket)}
+        agent_env = auto_env | {"SSH_AUTH_SOCK": str(agent_socket)}
+        auto_fetch(env=agent_env)
+        auto_fetch("--ssh-agent", env=agent_env, ok=False)
+        run(["ssh-add", root / "host_key"], env=agent_env)
+        auto_fetch(env=agent_env)
+        auto_fetch("--ssh-agent", env=agent_env, ok=False)
+        passed("empty or unauthorized automatic agent falls back to default keys")
+        run(["ssh-add", "-D"], env=agent_env)
         run(["ssh-add", key], env=agent_env)
+        auto_fetch("--identity-file", root / "host_key", env=agent_env, ok=False)
+        default.unlink()
+        auto_fetch(env=agent_env)
+        run([*automatic, "push", url(dest)], env=agent_env)
+        passed("agent is discovered without authentication flags; explicit identity overrides it")
         run([BIN, "-C", relay, "--ssh-agent", "--known-hosts", known,
              "fetch", url(source), "main"], env=agent_env)
     finally:
@@ -372,6 +439,12 @@ PermitUserRC no
 ForceCommand /usr/bin/python3 {service}
 LogLevel ERROR
 ''')
+        # Authentication refusal tests must not rate-limit later connections.
+        # Older OpenSSH releases predate this option and do not need it.
+        if subprocess.run(["/usr/bin/sshd", "-T", "-f", str(config), "-o", "PerSourcePenalties=no"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            with config.open("a") as f:
+                f.write("PerSourcePenalties no\n")
         sudo = [] if os.getuid() == 0 else ["sudo", "-n"]
         with (root / "sshd.log").open("w+") as log:
             server = subprocess.Popen([*sudo, "/usr/bin/sshd", "-D", "-e", "-f", str(config)],
@@ -389,6 +462,10 @@ LogLevel ERROR
                 else:
                     raise RuntimeError("test sshd did not start")
                 suite(root, port, user)
+            except Exception:
+                log.seek(0)
+                print(log.read(), file=sys.stderr)
+                raise
             finally:
                 subprocess.run([*sudo, "kill", "-TERM", "--", f"-{server.pid}"], check=False,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -30,7 +30,6 @@ Choose the endpoint outside the repository. For the supplied GitHub remote:
 
 ```sh
 export SAFE_GIT_URL=git@github.com:futpib/folio.git
-export SAFE_GIT_SSH_AGENT=true
 
 cd /path/to/folio
 safe-git fetch
@@ -38,12 +37,18 @@ safe-git merge --ff-only origin/main  # use the actual fetched branch
 safe-git push
 ```
 
-The SSH agent must already contain your key, and `~/.ssh/known_hosts` must contain
-a verified host key. Alternatively, set `SAFE_GIT_IDENTITY_FILE` to an explicit
-unencrypted private key, without setting `SAFE_GIT_SSH_AGENT`. Encrypted keys use
-the agent; there are no password/passphrase prompts. `--identity-file`,
-`--ssh-agent`, `--known-hosts FILE`, and `--url URL` are explicit flag alternatives.
-Do not set the endpoint or authentication environment by sourcing repository code.
+Authentication uses the host's SSH agent (`SSH_AUTH_SOCK`) first, then tries
+`~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, and `~/.ssh/id_rsa` in that order. Missing,
+unreadable, or encrypted default keys are skipped. Encrypted keys use the agent;
+there are no password/passphrase prompts. `~/.ssh/known_hosts` must contain a
+verified host key and is used automatically.
+
+To override authentication, `--identity-file KEY` (or `SAFE_GIT_IDENTITY_FILE`)
+uses only that unencrypted key; `--ssh-agent` (or `SAFE_GIT_SSH_AGENT=true`) uses
+only the agent. These overrides are mutually exclusive. `--known-hosts FILE`
+overrides the host-key file. The host environment and home directory are trusted;
+repository content and configuration are not. Do not source repository code to
+set the endpoint or authentication environment.
 
 No-argument fetch selects the current branch and stores `origin/BRANCH`;
 no-argument push sends the current branch under the same name. Repository
@@ -53,9 +58,9 @@ where authenticated connections or pushes go. Select different endpoints or
 branches explicitly when needed:
 
 ```sh
-safe-git -C /path/to/repo --ssh-agent fetch git@github.com:owner/source.git main
+safe-git -C /path/to/repo fetch git@github.com:owner/source.git main
 safe-git -C /path/to/repo merge --ff-only origin/main
-safe-git -C /path/to/repo --ssh-agent push git@github.com:owner/destination.git main:main
+safe-git -C /path/to/repo push git@github.com:owner/destination.git main:main
 ```
 
 These push commands really push. Tests use disposable local servers; they do not

@@ -24,7 +24,7 @@ struct Cli {
     /// Working-tree root or bare repository; never discovers parent repositories
     #[arg(short = 'C', default_value = ".", global = true)]
     repository: PathBuf,
-    /// Explicit unencrypted private key (use an agent for encrypted keys)
+    /// Use only this private key instead of the host's agent and default keys
     #[arg(
         long,
         global = true,
@@ -32,7 +32,7 @@ struct Cli {
         env = "SAFE_GIT_IDENTITY_FILE"
     )]
     identity_file: Option<PathBuf>,
-    /// Use SSH_AUTH_SOCK for authentication; never forward the agent
+    /// Use only SSH_AUTH_SOCK instead of also trying default keys; never forward it
     #[arg(long, global = true, env = "SAFE_GIT_SSH_AGENT")]
     ssh_agent: bool,
     /// Caller-selected endpoint for fetch/push without a positional URL

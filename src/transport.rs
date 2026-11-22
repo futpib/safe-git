@@ -94,6 +94,63 @@ pub struct Auth {
     pub agent: bool,
     pub known_hosts: PathBuf,
 }
+
+async fn authenticate_agent(
+    session: &mut client::Handle<HostKey>,
+    user: &str,
+    hash_alg: Option<keys::HashAlg>,
+) -> Result<bool> {
+    let mut agent = AgentClient::connect_env()
+        .await
+        .context("connect SSH_AUTH_SOCK")?;
+    let identities = agent.request_identities().await?;
+    ensure!(identities.len() <= 64, "too many SSH agent identities");
+    for identity in identities {
+        if let AgentIdentity::PublicKey { key, .. } = identity
+            && session
+                .authenticate_publickey_with(user, key, hash_alg, &mut agent)
+                .await?
+                .success()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn authenticate_defaults(
+    session: &mut client::Handle<HostKey>,
+    user: &str,
+    hash_alg: Option<keys::HashAlg>,
+) -> Result<bool> {
+    // The host environment and home directory are trusted. Repository config
+    // never participates in selecting credentials or executing authentication.
+    if std::env::var_os("SSH_AUTH_SOCK").is_some()
+        && authenticate_agent(session, user, hash_alg)
+            .await
+            .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+    if let Some(home) = std::env::home_dir() {
+        for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+            // Missing, unreadable, and encrypted defaults are skipped. Encrypted
+            // keys can be loaded into the host's agent; there are no prompts.
+            let Ok(key) = keys::load_secret_key(home.join(".ssh").join(name), None) else {
+                continue;
+            };
+            if session
+                .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg))
+                .await?
+                .success()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 struct HostKey {
     host: String,
     port: u16,
@@ -126,8 +183,8 @@ pub struct Wire {
 impl Wire {
     pub async fn connect(remote: &Remote, auth: &Auth, receive: bool) -> Result<Self> {
         ensure!(
-            auth.identity.is_some() != auth.agent,
-            "choose exactly one of --identity-file and --ssh-agent"
+            !(auth.identity.is_some() && auth.agent),
+            "--identity-file and --ssh-agent cannot be used together"
         );
         // russh supports plain/hashed hostnames, but not OpenSSH marker semantics.
         // Reject marker-bearing files rather than overlooking revoked/CA entries.
@@ -164,27 +221,15 @@ impl Wire {
                 )
                 .await?
                 .success()
+        } else if auth.agent {
+            authenticate_agent(&mut session, &remote.user, hash_alg).await?
         } else {
-            let mut agent = AgentClient::connect_env()
-                .await
-                .context("connect SSH_AUTH_SOCK")?;
-            let identities = agent.request_identities().await?;
-            ensure!(identities.len() <= 64, "too many SSH agent identities");
-            let mut ok = false;
-            for identity in identities {
-                if let AgentIdentity::PublicKey { key, .. } = identity
-                    && session
-                        .authenticate_publickey_with(&remote.user, key, hash_alg, &mut agent)
-                        .await?
-                        .success()
-                {
-                    ok = true;
-                    break;
-                }
-            }
-            ok
+            authenticate_defaults(&mut session, &remote.user, hash_alg).await?
         };
-        ensure!(authenticated, "SSH authentication failed");
+        ensure!(
+            authenticated,
+            "SSH authentication failed; load an authorized key into the SSH agent or provide --identity-file with an unencrypted key"
+        );
         let channel = session.channel_open_session().await?;
         channel.exec(true, remote.command(receive)).await?;
         Ok(Self {
