@@ -2,6 +2,8 @@
 //! temporary sshd's forced command, keeping the entire fixture in Rust.
 #[path = "suites/bootstrap.rs"]
 mod bootstrap;
+#[path = "suites/extended.rs"]
+mod extended;
 #[path = "suites/http_packages.rs"]
 mod http_packages;
 #[path = "suites/output.rs"]
@@ -31,6 +33,26 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("extended_ssh_push", || {
+                extended::ssh_push();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("extended_history", || {
+                extended::history();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("extended_stash_status", || {
+                extended::stash_status();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("extended_sequences", || {
+                extended::sequences();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("extended_http_push", || {
+                extended::http_push();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("workflow_ignores", || {
                 workflow::ignores();
                 Ok(())

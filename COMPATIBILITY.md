@@ -1,54 +1,38 @@
-# Package-manager compatibility
+# Git compatibility
 
-Everyday commands also include `status` (short/porcelain v1), `add` (paths,
-directories, `-A`, `-u`, `-f`), `switch` (`-c`, `-C`, `--detach`), `restore`
-(`--staged`, `--worktree`, `--source`), and tracked-file `stash`/`stash pop`
-(`--index`, plus `list`, `apply`, and dropping the latest entry). Paths are
-literal and relative to the repository root. Stash conflicts leave files and
-the saved entry unchanged. `.gitignore` and `.git/info/exclude` are inert data;
-repository-configured global excludes and filters are ignored. Unsupported
-POSIX character classes in ignore patterns fail before staging files.
+The everyday workflow includes working-tree/bare `init`, clone/fetch/pull/push,
+branch listing/creation/rename/deletion, switch (including `-` and tracking),
+status, add, restore, diff, log, commit/amend, reset, reflog, and stash.
+Add/restore accept relative paths, wildcard pathspecs, and built-in `-p` hunk
+selection. Status includes renames, ahead/behind counts, and porcelain v1/v2.
+Stash supports untracked/ignored files, older entries, show/apply/pop/drop/clear.
 
-Supported: paru's AUR clone/fetch, review diff, seen marker, saved-edit commit
-and clean rebase; makepkg's Git mirror, prune, local clone, tag/branch/commit
-checkout and tar checksum workflow. `rev-list --count`, `rev-parse --short`,
-`describe`, and basic `log` support common `pkgver()` functions.
+Merge, cherry-pick, revert, and rebase support conflicts: edit the files, `add`
+them, then use the operation's `--continue`, `--skip` (where applicable), or
+`--abort`. Conflicts use Git index stages. Interactive rebase reads a plan from
+stdin: `pick`, `reword`, `edit`, `squash`, `fixup`, or `drop` followed by a commit
+and optional message; end with `done`. No editor or `exec` instruction runs.
+Rebase flattens local merges. Interrupted checkout updates use `recover`.
 
-Transfers use SSH, smart HTTP(S), native `git://`, or verified local objects.
-HTTP uses the host's trusted CA certificates. There are no HTTP credential
-helpers, authentication prompts, redirects, or subprocess fallbacks.
+Fetch supports SSH, HTTP(S), native `git://`, and local objects. Push supports
+SSH and HTTP(S), branch/tag refspecs, `--tags`, deletion, explicit `--force`, and
+`--force-with-lease[=REF:OID]`. Without an explicit force request, existing
+branches must fast-forward and existing tags cannot be replaced. An optional
+caller-provided `SAFE_GIT_HTTP_TOKEN` is sent as a bearer token only over HTTPS.
+Redirects and credential helpers are never followed.
 
-`clone` records the endpoint outside the repository under
-`${XDG_STATE_HOME:-~/.local/state}/safe-git` (or `SAFE_GIT_STATE_DIR`). Records bind
-the endpoint to the metadata directory's location and filesystem identity.
-Changing `.git/config` cannot change that endpoint. A Git-created or relocated
-cache needs explicit registration before a URL-less fetch:
+Clone registers the endpoint outside the repository in trusted host state.
+`push -u origin BRANCH` records its upstream there; subsequent push/pull use
+that mapping. Existing Git-created repositories require an explicit URL or
+registration with `safe-git config remote.origin.url URL`. Repository remote
+URLs, upstream settings, and URL rewrites cannot redirect network operations.
 
-```sh
-safe-git -C /path/to/cache config remote.origin.url https://aur.archlinux.org/package.git
-```
+Paru's `--git /path/to/safe-git` selects this client; makepkg selects `git`
+through `PATH`. Their clone/fetch/review/rebase, mirror/prune/checkout/archive,
+and common `pkgver()` commands are covered by integration tests.
 
-Paru's `--git /path/to/safe-git` selects its own client. Makepkg invokes `git`
-through `PATH`; testing/replacement must also provide a `git` symlink to safe-git
-in a caller-controlled directory on that path. This repository does not install
-that symlink or modify either application's configuration.
-
-Deliberate differences:
-
-- `clone -s` copies verified objects; it never creates or follows alternates.
-- Attributes, hooks, includes, helpers, aliases, pagers, signers, merge drivers,
-  submodule commands and sequencer scripts are not implemented.
-- Merge/rebase conflicts and local merge-commit rebases fail before changing the
-  checkout. Review merges require `--no-ff --no-commit`; ordinary merges require
-  `--ff-only`. Push uses SSH and is fast-forward only. `push -u origin BRANCH`
-  resolves only a host-registered or caller-supplied endpoint; its branch mapping is stored
-  outside the repository for subsequent push/pull. Repository `pushurl`, URL
-  rewrites and upstream settings cannot redirect these transfers.
-- Checkout/reset reject unsafe paths, escaping symlinks, external hard links,
-  file/directory transitions and unsupported index/metadata formats. Commands
-  operate at the repository root and retain bounded parsing/traversal budgets.
-- Text output is plain and escapes repository-supplied terminal controls.
-  Tar output preserves Git's bytes for makepkg, with attributes ignored.
-
-This is the package-manager command subset, not every command an arbitrary
-PKGBUILD can request. Unknown commands and options fail instead of invoking Git.
+Hooks, filters, aliases, signers, includes, external diffs, merge drivers,
+submodule commands, and executable sequencer instructions remain unsupported.
+Ignore files are bounded inert patterns. Unsafe paths, escaping symlinks,
+external hard links, unsupported repository formats, and file/directory
+transitions are rejected. Unknown options fail rather than invoking Git.

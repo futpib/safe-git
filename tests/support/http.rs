@@ -125,7 +125,17 @@ fn serve(mut stream: impl Read + Write, root: &PathBuf) {
         .env("PATH_INFO", path)
         .env("QUERY_STRING", query)
         .env("CONTENT_LENGTH", length.to_string())
-        .env("CONTENT_TYPE", "application/x-git-upload-pack-request")
+        .env(
+            "CONTENT_TYPE",
+            lines
+                .clone()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.trim())
+                })
+                .unwrap_or(""),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -249,7 +249,7 @@ pub fn suite() {
         .run();
     assert_eq!(revision(&work, "HEAD^"), next);
     assert!(read(work.join("PKGBUILD")).contains("pkgrel=2"));
-    // A conflicting rebase must leave both local commit and working files intact.
+    // A conflicting rebase records stages and can restore the original commit and files.
     let preserved = revision(&work, "HEAD");
     write(
         seed.join("PKGBUILD"),
@@ -267,6 +267,7 @@ pub fn suite() {
             "--stat",
         ])
         .fails();
+    safe(&work, &state).args(["rebase", "--abort"]).run();
     assert_eq!(revision(&work, "HEAD"), preserved);
     assert!(read(work.join("PKGBUILD")).contains("pkgrel=2"));
     assert!(!marker.exists());

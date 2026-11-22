@@ -200,6 +200,10 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             "rev-list",
             "describe",
             "archive",
+            "cherry-pick",
+            "revert",
+            "branch",
+            "reflog",
             "status",
             "add",
             "switch",
@@ -211,8 +215,19 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
     );
     let repo = Repo::open(&cli.repository)?;
     ready(&repo)?;
+    if matches!(
+        name,
+        "checkout" | "branch" | "stash" | "switch" | "update-ref" | "symbolic-ref"
+    ) {
+        ensure!(
+            !repo.exists("safe-git-sequence")?,
+            "operation in progress; continue or abort it first"
+        );
+    }
     let mut store = Store::new(&repo);
     match name {
+        "branch" => crate::history::branch(cli, &repo, &mut store, items),
+        "reflog" => crate::history::reflog(&repo, items),
         "status" | "add" | "switch" | "restore" | "stash" => {
             crate::workflow::run(cli, &repo, &mut store, name, items)
         }
@@ -393,17 +408,7 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                 Ok(())
             }
         }
-        "reset" => {
-            let pos = args(items, &["--hard", "-q", "--quiet"])?;
-            ensure!(flag(items, "--hard"), "only reset --hard is implemented");
-            let id = revision::commit(&repo, &mut store, one(&pos, "HEAD")?)?;
-            porcelain::reset(
-                &repo,
-                &mut store,
-                id,
-                cli.quiet || flag(items, "-q") || flag(items, "--quiet"),
-            )
-        }
+        "reset" => crate::history::reset(&repo, &mut store, items, cli.quiet),
         "checkout" => {
             let mut filtered = Vec::new();
             let mut branch = None;
@@ -439,20 +444,13 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                 cli.quiet || flag(items, "-q") || flag(items, "--quiet"),
             )
         }
-        "rebase" => {
-            let pos = args(items, &["--stat", "-q", "--quiet"])?;
-            let up = revision::upstream(&repo)?;
-            let id = revision::commit(&repo, &mut store, one(&pos, &up)?)?;
-            porcelain::rebase(
-                &repo,
-                &mut store,
-                id,
-                &cli.config,
-                cli.quiet || flag(items, "-q") || flag(items, "--quiet"),
-            )
+        "rebase" | "cherry-pick" | "revert" => {
+            crate::sequence::run(cli, &repo, &mut store, name, items)
         }
         "commit" => {
             let mut message = None;
+            let mut amend = false;
+            let mut no_edit = false;
             let mut all = false;
             let mut quiet = cli.quiet;
             let mut i = 0;
@@ -463,19 +461,43 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                         i += 1;
                         message = Some(items.get(i).context("missing commit message")?.as_str());
                     }
+                    "--amend" => amend = true,
+                    "--no-edit" => no_edit = true,
                     "-a" | "--all" => all = true,
                     "-q" | "--quiet" => quiet = true,
                     other => anyhow::bail!("unsupported commit option {other}"),
                 }
                 i += 1;
             }
+            if amend {
+                crate::sequence::amend_allowed(&repo)?;
+            }
+            if !amend
+                && let Some(message) = message
+                && crate::sequence::commit_pending(cli, &repo, &mut store, message)?
+            {
+                return Ok(());
+            }
+            let previous_message = if amend && no_edit && message.is_none() {
+                Some(String::from_utf8(
+                    porcelain::message(
+                        &store
+                            .get(repo.read_ref("HEAD")?.context("unborn HEAD")?)?
+                            .data,
+                    )?
+                    .to_vec(),
+                )?)
+            } else {
+                None
+            };
             porcelain::commit(
                 &repo,
                 &mut store,
                 &cli.config,
-                message.context("commit requires -m; editors are not implemented")?,
-                all,
-                quiet,
+                message.or(previous_message.as_deref()).context(
+                    "commit requires -m or --amend --no-edit; editors are not implemented",
+                )?,
+                porcelain::CommitOptions { all, quiet, amend },
             )
         }
         "diff" => diff(&repo, &mut store, items),
@@ -674,7 +696,7 @@ fn abbrev(store: &mut Store<'_>, id: Oid, length: usize) -> Result<String> {
     }
     Ok(full[..length].to_owned())
 }
-fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Result<()> {
+pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Result<()> {
     let separator = items.iter().position(|a| a == "--").unwrap_or(items.len());
     let pos = args(
         &items[..separator],

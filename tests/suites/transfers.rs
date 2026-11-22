@@ -551,9 +551,9 @@ pub fn suite() {
     passed("explicit agent authentication works; unauthorized private key rejected");
 
     for args in [
-        vec!["merge", "origin/main"],
-        vec!["push", &dest_url, "+main"],
-        vec!["push", &dest_url, ":main"],
+        vec!["merge", "--unknown-option", "origin/main"],
+        vec!["push", "--unknown-option", &dest_url, "+main"],
+        vec!["push", &dest_url, ":../main"],
         vec!["fetch", "origin", "main"],
         vec!["fetch", &source_url, "../main"],
         vec!["fetch", "ext::probe", "main"],
@@ -561,5 +561,7 @@ pub fn suite() {
         safe(&args).fails();
     }
     assert!(!marker.exists());
-    passed("missing ff-only, force/deletion refspecs, remote aliases, traversal, helpers rejected");
+    passed(
+        "unknown options, unsafe refspecs, unregistered remote aliases, traversal and helpers rejected",
+    );
 }

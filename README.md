@@ -31,9 +31,9 @@ safe-git push
 
 SSH uses your agent or default keys in `~/.ssh`; a verified host key must already
 be in `~/.ssh/known_hosts`. Your host environment and credentials are trusted.
-Run `safe-git --help` for options, bare-repository initialization, and checkout
-recovery. See [package-manager compatibility](COMPATIBILITY.md) for the supported
-paru/makepkg commands and deliberate restrictions.
+Run `safe-git --help` for options, repository initialization, and checkout
+recovery. See [Git compatibility](COMPATIBILITY.md) for supported workflows
+and deliberate restrictions.
 
 Experimental and unaudited. Preventing repository-directed execution is the
 design, not a guarantee against implementation or dependency bugs. There is no

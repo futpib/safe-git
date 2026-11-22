@@ -9,6 +9,7 @@ pub struct Entry {
     pub oid: Oid,
 }
 pub type Entries = BTreeMap<Vec<u8>, Entry>;
+pub type Conflicts = BTreeMap<Vec<u8>, [Option<Entry>; 3]>;
 
 pub fn path(name: &[u8]) -> Result<()> {
     ensure!(
@@ -117,6 +118,14 @@ pub fn no_prefix_conflicts(entries: &Entries) -> Result<()> {
     Ok(())
 }
 pub fn decode(bytes: &[u8]) -> Result<Entries> {
+    let (entries, conflicts) = decode_full(bytes)?;
+    ensure!(
+        conflicts.is_empty(),
+        "unmerged index entries; resolve conflicts and add the files first"
+    );
+    Ok(entries)
+}
+pub fn decode_full(bytes: &[u8]) -> Result<(Entries, Conflicts)> {
     ensure!(
         bytes.len() >= 32 && &bytes[..4] == b"DIRC",
         "invalid Git index"
@@ -133,6 +142,8 @@ pub fn decode(bytes: &[u8]) -> Result<Entries> {
     let mut pos = 12;
     let mut entries = Entries::new();
     let mut previous = Vec::<u8>::new();
+    let mut previous_stage = 0;
+    let mut conflicts = Conflicts::new();
     for _ in 0..count {
         let start = pos;
         ensure!(pos + 62 <= end, "truncated index entry");
@@ -141,10 +152,7 @@ pub fn decode(bytes: &[u8]) -> Result<Entries> {
         let oid = Oid(bytes[pos + 40..pos + 60].try_into()?);
         let flags = u16::from_be_bytes(bytes[pos + 60..pos + 62].try_into()?);
         pos += 62;
-        ensure!(
-            flags & 0x3000 == 0,
-            "unmerged index entries are unsupported"
-        );
+        let stage = (flags >> 12) & 3;
         ensure!(
             flags & 0xc000 == 0,
             "assume-unchanged, sparse, and extended index entries are unsupported"
@@ -188,11 +196,19 @@ pub fn decode(bytes: &[u8]) -> Result<Entries> {
             pos += pad;
         }
         ensure!(
-            previous.is_empty() || previous < name,
+            previous.is_empty()
+                || previous < name
+                || (previous == name && previous_stage < stage && previous_stage > 0),
             "duplicate or unordered index entries"
         );
         previous = name.clone();
-        entries.insert(name, Entry { mode, oid });
+        previous_stage = stage;
+        if stage == 0 {
+            entries.insert(name, Entry { mode, oid });
+        } else {
+            conflicts.entry(name).or_insert([None; 3])[usize::from(stage) - 1] =
+                Some(Entry { mode, oid });
+        }
     }
     while pos < end {
         ensure!(pos + 8 <= end, "truncated index extension");
@@ -206,15 +222,47 @@ pub fn decode(bytes: &[u8]) -> Result<Entries> {
         ensure!(size <= end - pos, "index extension exceeds input");
         pos += size;
     }
-    no_prefix_conflicts(&entries)?;
-    Ok(entries)
+    validate_conflicts(&entries, &conflicts)?;
+    Ok((entries, conflicts))
 }
 pub fn encode(entries: &Entries) -> Result<Vec<u8>> {
+    encode_full(entries, &Conflicts::new())
+}
+fn validate_conflicts(entries: &Entries, conflicts: &Conflicts) -> Result<()> {
+    let mut paths = entries.clone();
+    for (path, stages) in conflicts {
+        ensure!(
+            !entries.contains_key(path),
+            "conflict and stage-zero entry at same path"
+        );
+        let entry = stages.iter().flatten().next().context("empty conflict")?;
+        paths.insert(path.clone(), *entry);
+    }
+    no_prefix_conflicts(&paths)
+}
+pub fn encode_full(entries: &Entries, conflicts: &Conflicts) -> Result<Vec<u8>> {
+    validate_conflicts(entries, conflicts)?;
     ensure!(entries.len() <= MAX_OBJECTS, "index entry limit exceeded");
     no_prefix_conflicts(entries)?;
     let mut out = b"DIRC\0\0\0\x02".to_vec();
-    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
-    for (name, entry) in entries {
+    let mut records = BTreeMap::new();
+    for (path, entry) in entries {
+        records.insert((path, 0u16), entry);
+    }
+    for (path, stages) in conflicts {
+        ensure!(
+            !entries.contains_key(path),
+            "stage zero and conflict at same path"
+        );
+        for (i, entry) in stages.iter().enumerate() {
+            if let Some(entry) = entry {
+                records.insert((path, (i + 1) as u16), entry);
+            }
+        }
+    }
+    ensure!(records.len() <= MAX_OBJECTS, "index entry limit exceeded");
+    out.extend_from_slice(&(records.len() as u32).to_be_bytes());
+    for ((name, stage), entry) in records {
         path(name)?;
         mode(entry.mode)?;
         let start = out.len();
@@ -223,7 +271,7 @@ pub fn encode(entries: &Entries) -> Result<Vec<u8>> {
         out.extend_from_slice(&entry.mode.to_be_bytes());
         out.extend_from_slice(&[0; 12]);
         out.extend_from_slice(&entry.oid.0);
-        out.extend_from_slice(&(name.len().min(0xfff) as u16).to_be_bytes());
+        out.extend_from_slice(&((name.len().min(0xfff) as u16) | (stage << 12)).to_be_bytes());
         out.extend_from_slice(name);
         out.push(0);
         while !(out.len() - start).is_multiple_of(8) {

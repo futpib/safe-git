@@ -19,6 +19,12 @@ pub fn index(repo: &Repo) -> Result<Entries> {
         .transpose()
         .map(|v| v.unwrap_or_default())
 }
+pub fn index_full(repo: &Repo) -> Result<(Entries, index::Conflicts)> {
+    repo.read("index", checkout::INDEX_LIMIT)?
+        .map(|b| index::decode_full(&b))
+        .transpose()
+        .map(|v| v.unwrap_or_default())
+}
 pub fn tree(store: &mut Store<'_>, id: Oid) -> Result<Entries> {
     if id.to_string() == revision::EMPTY_TREE {
         Ok(Entries::new())
@@ -149,14 +155,20 @@ pub(crate) fn new_commit(
     repo.write_object(&object)?;
     object.oid()
 }
+#[derive(Default)]
+pub struct CommitOptions {
+    pub all: bool,
+    pub quiet: bool,
+    pub amend: bool,
+}
 pub fn commit(
     repo: &Repo,
     store: &mut Store<'_>,
     overrides: &[String],
     message: &str,
-    all: bool,
-    quiet: bool,
+    options: CommitOptions,
 ) -> Result<()> {
+    let CommitOptions { all, quiet, amend } = options;
     ensure!(!message.trim().is_empty(), "empty commit message");
     for state in [
         "safe-git-checkout",
@@ -194,15 +206,30 @@ pub fn commit(
     let before = index::tree(store, old)?;
     if let Some(old) = old {
         ensure!(
-            store.get(old)?.commit()?.0 != tree,
+            amend || store.get(old)?.commit()?.0 != tree,
             "nothing to commit, working tree clean"
         );
     }
+    let previous = if amend {
+        Some(store.get(old.context("cannot amend an unborn branch")?)?)
+    } else {
+        None
+    };
+    let parents = if let Some(obj) = &previous {
+        obj.commit()?.1
+    } else {
+        old.into_iter().collect::<Vec<_>>()
+    };
+    let author = if let Some(obj) = &previous {
+        author(&obj.data)?
+    } else {
+        identity(repo, overrides, "AUTHOR")?
+    };
     let id = new_commit(
         repo,
         tree,
-        &old.into_iter().collect::<Vec<_>>(),
-        &identity(repo, overrides, "AUTHOR")?,
+        &parents,
+        &author,
         &identity(repo, overrides, "COMMITTER")?,
         message.as_bytes(),
     )?;
@@ -211,10 +238,22 @@ pub fn commit(
             && repo.read("index", checkout::INDEX_LIMIT)? == original,
         "HEAD or index changed concurrently"
     );
+    let logs = crate::history::logs(
+        repo,
+        &head,
+        old,
+        id,
+        &format!(
+            "commit{}: {}",
+            if amend { " (amend)" } else { "" },
+            message.lines().next().unwrap_or_default()
+        ),
+    )?;
     // Commit records a snapshot. Never check it out over subsequent or unstaged edits.
     index_lock.file.write_all(&index::encode(&entries)?)?;
     index_lock.commit("index")?;
     ref_lock.commit(id)?;
+    crate::history::finish_logs(logs)?;
     if !quiet {
         println!(
             "[{} {}] {}",
@@ -254,6 +293,7 @@ pub fn reset(repo: &Repo, store: &mut Store<'_>, id: Oid, quiet: bool) -> Result
     let old = repo.read_ref(&head)?;
     store.get(id)?.commit()?;
     let after = tree(store, id)?;
+    let logs = crate::history::logs(repo, &head, old, id, &format!("reset: moving to {id}"))?;
     checkout::apply(
         repo,
         store,
@@ -267,6 +307,7 @@ pub fn reset(repo: &Repo, store: &mut Store<'_>, id: Oid, quiet: bool) -> Result
             reset: true,
         },
     )?;
+    crate::history::finish_logs(logs)?;
     for path in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"] {
         repo.remove(path)?;
     }
@@ -287,6 +328,8 @@ pub fn checkout(
     force: bool,
     quiet: bool,
 ) -> Result<()> {
+    let old_head = repo.head()?;
+    let old_tip = repo.read_ref("HEAD")?;
     let id = revision::commit(repo, store, value)?;
     let branch = if let Some(name) = branch {
         Some(format!("refs/heads/{}", crate::repo::branch(name)?))
@@ -303,6 +346,21 @@ pub fn checkout(
     // prepare_ref("HEAD") replaces HEAD itself with a direct object ID.
     let old = repo.read_ref(reference)?;
     let after = tree(store, id)?;
+    let from = old_head
+        .strip_prefix("refs/heads/")
+        .map(str::to_owned)
+        .unwrap_or_else(|| old_tip.map(|v| v.to_string()).unwrap_or_default());
+    let to = branch
+        .as_deref()
+        .and_then(|b| b.strip_prefix("refs/heads/"))
+        .unwrap_or(value);
+    let head_log = crate::history::prepare_log(
+        repo,
+        "HEAD",
+        old_tip,
+        id,
+        &format!("checkout: moving from {from} to {to}"),
+    )?;
     checkout::apply(
         repo,
         store,
@@ -316,6 +374,7 @@ pub fn checkout(
             reset: force,
         },
     )?;
+    head_log.commit()?;
     if !quiet {
         if let Some(branch) = branch {
             eprintln!(
@@ -412,151 +471,6 @@ pub(crate) fn three_way(
     index::no_prefix_conflicts(&out)?;
     Ok(out)
 }
-fn clean(repo: &Repo, store: &mut Store<'_>, old: Oid) -> Result<()> {
-    let entries = index(repo)?;
-    ensure!(
-        entries == tree(store, old)?,
-        "staged changes would be overwritten"
-    );
-    let work = checkout::Work::new(repo)?;
-    for (path, entry) in entries {
-        if entry.mode != 0o160000 {
-            ensure!(
-                work.state(&path)? == Some(entry),
-                "local changes would be overwritten"
-            );
-        }
-    }
-    Ok(())
-}
-pub fn review_merge(repo: &Repo, store: &mut Store<'_>, incoming: Oid, quiet: bool) -> Result<()> {
-    let head = repo.head()?;
-    let old = repo.read_ref(&head)?.context("unborn HEAD")?;
-    clean(repo, store, old)?;
-    if crate::object::ancestor(store, incoming, old)? {
-        if !quiet {
-            println!("Already up to date.");
-        }
-        return Ok(());
-    }
-    let base = revision::merge_base(store, old, incoming)?;
-    let (a, b, c) = (
-        tree(store, base)?,
-        tree(store, old)?,
-        tree(store, incoming)?,
-    );
-    let after = three_way(repo, store, &a, &b, &c)?;
-    checkout::apply(
-        repo,
-        store,
-        Update {
-            reference: &head,
-            old: Some(old),
-            new: old,
-            after,
-            force: false,
-            head_after: None,
-            reset: false,
-        },
-    )?;
-    repo.atomic("MERGE_HEAD", format!("{incoming}\n").as_bytes())?;
-    if !quiet {
-        eprintln!("Automatic merge went well; stopped before committing as requested");
-    }
-    Ok(())
-}
-pub fn rebase(
-    repo: &Repo,
-    store: &mut Store<'_>,
-    incoming: Oid,
-    overrides: &[String],
-    quiet: bool,
-) -> Result<()> {
-    let head = repo.head()?;
-    ensure!(head != "HEAD", "rebase requires a branch");
-    let old = repo.read_ref(&head)?.context("unborn HEAD")?;
-    clean(repo, store, old)?;
-    if crate::object::ancestor(store, incoming, old)? {
-        if !quiet {
-            println!(
-                "Current branch {} is up to date.",
-                head.trim_start_matches("refs/heads/")
-            );
-        }
-        return Ok(());
-    }
-    let base = revision::merge_base(store, old, incoming)?;
-    let mut replay = Vec::new();
-    let mut cursor = old;
-    while cursor != base {
-        ensure!(
-            replay.len() < crate::object::MAX_OBJECTS,
-            "rebase history exceeds limit"
-        );
-        let parents = store.get(cursor)?.commit()?.1;
-        ensure!(
-            parents.len() == 1,
-            "rebasing local merge commits is unsupported; working tree unchanged"
-        );
-        replay.push(cursor);
-        cursor = parents[0];
-    }
-    let mut current = incoming;
-    let committer = if replay.is_empty() {
-        None
-    } else {
-        Some(identity(repo, overrides, "COMMITTER")?)
-    };
-    for id in replay.into_iter().rev() {
-        let object = store.get(id)?;
-        let parent = object.commit()?.1[0];
-        let (a, b, c) = (
-            tree(store, parent)?,
-            tree(store, current)?,
-            tree(store, id)?,
-        );
-        let after = three_way(repo, store, &a, &b, &c)?;
-        let tree = write_tree(repo, &after)?;
-        if tree == store.get(current)?.commit()?.0 {
-            continue;
-        }
-        let end = object
-            .data
-            .windows(2)
-            .position(|w| w == b"\n\n")
-            .context("invalid commit")?;
-        let author = object.data[..end]
-            .split(|b| *b == b'\n')
-            .find_map(|l| l.strip_prefix(b"author "))
-            .context("missing author")?;
-        current = new_commit(
-            repo,
-            tree,
-            &[current],
-            std::str::from_utf8(author)?,
-            committer.as_deref().unwrap(),
-            &object.data[end + 2..],
-        )?;
-    }
-    let after = tree(store, current)?;
-    checkout::apply(
-        repo,
-        store,
-        Update {
-            reference: &head,
-            old: Some(old),
-            new: current,
-            after,
-            force: false,
-            head_after: None,
-            reset: false,
-        },
-    )?;
-    if !quiet {
-        println!("Successfully rebased and updated {head}.");
-    }
-    Ok(())
-}
 pub fn subject(data: &[u8]) -> String {
     let message = data
         .windows(2)
@@ -566,4 +480,23 @@ pub fn subject(data: &[u8]) -> String {
     crate::compat::text(&String::from_utf8_lossy(
         message.split(|b| *b == b'\n').next().unwrap_or_default(),
     ))
+}
+
+pub fn message(data: &[u8]) -> Result<&[u8]> {
+    let end = data
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .context("invalid commit")?;
+    Ok(&data[end + 2..])
+}
+pub fn author(data: &[u8]) -> Result<String> {
+    let end = data
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .context("invalid commit")?;
+    let author = data[..end]
+        .split(|b| *b == b'\n')
+        .find_map(|l| l.strip_prefix(b"author "))
+        .context("missing author")?;
+    Ok(std::str::from_utf8(author)?.to_owned())
 }

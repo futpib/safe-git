@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 pub struct Advertisement {
     pub refs: HashMap<String, Oid>,
-    caps: HashSet<String>,
+    pub(crate) caps: HashSet<String>,
 }
 impl Advertisement {
     pub(crate) fn new() -> Self {
@@ -136,24 +136,6 @@ pub async fn advertise(wire: &mut Wire) -> Result<Advertisement> {
     Ok(ad)
 }
 
-pub async fn fetch(
-    remote: &Remote,
-    auth: &Auth,
-    branch: &str,
-    expected: Option<Oid>,
-    haves: &[Oid],
-) -> Result<(Oid, Objects)> {
-    let mut wire = Wire::connect(remote, auth, false).await?;
-    let ad = advertise(&mut wire).await?;
-    let tip = ad.branch(branch).context("remote branch does not exist")?;
-    ensure!(
-        expected.is_none_or(|id| id == tip),
-        "remote branch changed while preparing transfer; retry"
-    );
-    let objects = transfer(wire, &ad, &[tip], haves).await?;
-    Ok((tip, objects))
-}
-
 pub(crate) fn request(ad: &Advertisement, tips: &[Oid], haves: &[Oid]) -> Result<Vec<u8>> {
     ensure!(
         !tips.is_empty() && tips.len() <= 100_000,
@@ -274,10 +256,12 @@ pub async fn discover(remote: &Remote, auth: &Auth) -> Result<Advertisement> {
 pub struct Push {
     wire: Wire,
     pub old: Option<Oid>,
-    branch: String,
+    name: String,
+    delete_refs: bool,
 }
 impl Push {
-    pub async fn prepare(remote: &Remote, auth: &Auth, branch: &str) -> Result<Self> {
+    pub async fn prepare(remote: &Remote, auth: &Auth, name: &str) -> Result<Self> {
+        repo::refname(name)?;
         let mut wire = Wire::connect(remote, auth, true).await?;
         let ad = advertise(&mut wire).await?;
         ensure!(
@@ -285,8 +269,9 @@ impl Push {
             "server does not support required report-status capability"
         );
         Ok(Self {
-            old: ad.branch(branch),
-            branch: branch.to_owned(),
+            old: ad.refs.get(name).copied(),
+            name: name.to_owned(),
+            delete_refs: ad.caps.contains("delete-refs"),
             wire,
         })
     }
@@ -300,8 +285,11 @@ impl Push {
         Ok(())
     }
     pub async fn send(mut self, new: Oid, pack: Vec<u8>) -> Result<()> {
-        ensure!(new != Oid::ZERO, "deletion is unsupported");
-        let name = format!("refs/heads/{}", self.branch);
+        ensure!(
+            new != Oid::ZERO || self.delete_refs,
+            "server does not allow deletion"
+        );
+        let name = self.name.clone();
         let mut request = transport::packet(
             format!(
                 "{} {new} {name}\0report-status\n",

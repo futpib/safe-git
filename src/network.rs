@@ -1,4 +1,4 @@
-//! Read-only transports. No Git helper, credential helper, URL rewrite, or local subprocess.
+//! In-process transports. No Git helper, credential helper, URL rewrite, or local subprocess.
 use crate::{
     object::{MAX_OBJECTS, MAX_PACK, MAX_TOTAL, Objects, Oid, ReadObjects},
     protocol::{self, Advertisement},
@@ -145,7 +145,7 @@ async fn http_ad(client: &reqwest::Client, base: &url::Url) -> Result<Advertisem
     let mut url = service_url(base, "info/refs")?;
     url.set_query(Some("service=git-upload-pack"));
     let data = body(
-        client.get(url).send().await?,
+        http_auth(client.get(url), base)?.send().await?,
         "application/x-git-upload-pack-advertisement",
         8 * 1024 * 1024,
     )
@@ -230,8 +230,7 @@ pub async fn fetch(
             }
             let tips: HashSet<_> = refs.values().copied().collect();
             let request = protocol::request(&ad, &tips.into_iter().collect::<Vec<_>>(), haves)?;
-            let response = client
-                .post(service_url(&base, "git-upload-pack")?)
+            let response = http_auth(client.post(service_url(&base, "git-upload-pack")?), &base)?
                 .header(
                     reqwest::header::CONTENT_TYPE,
                     "application/x-git-upload-pack-request",
@@ -354,4 +353,140 @@ async fn native_ad(url: &url::Url) -> Result<(tokio::net::TcpStream, Advertiseme
         ad.line(&data, count == 0)?;
     }
     anyhow::bail!("native Git advertisement exceeds limit")
+}
+
+/// A receive-pack session bound to a caller-selected endpoint and exact ref.
+pub enum Push {
+    Ssh(protocol::Push),
+    Http {
+        client: reqwest::Client,
+        base: url::Url,
+        name: String,
+        old: Option<Oid>,
+        delete_refs: bool,
+    },
+}
+fn http_auth(request: reqwest::RequestBuilder, base: &url::Url) -> Result<reqwest::RequestBuilder> {
+    if let Ok(token) = std::env::var("SAFE_GIT_HTTP_TOKEN") {
+        ensure!(base.scheme() == "https", "HTTP tokens require HTTPS");
+        ensure!(
+            !token.is_empty() && token.len() <= 8192 && !token.chars().any(char::is_control),
+            "invalid HTTP token"
+        );
+        Ok(request.bearer_auth(token))
+    } else {
+        Ok(request)
+    }
+}
+impl Push {
+    pub async fn prepare(url: &str, auth: &Auth, name: &str) -> Result<Self> {
+        crate::repo::refname(name)?;
+        match endpoint(url)? {
+            Endpoint::Ssh(remote) => Ok(Self::Ssh(
+                protocol::Push::prepare(&remote, auth, name).await?,
+            )),
+            Endpoint::Http(base) => {
+                let client = client()?;
+                let mut url = service_url(&base, "info/refs")?;
+                url.set_query(Some("service=git-receive-pack"));
+                let data = body(
+                    http_auth(client.get(url), &base)?.send().await?,
+                    "application/x-git-receive-pack-advertisement",
+                    8 * 1024 * 1024,
+                )
+                .await?;
+                let mut bytes = data.as_slice();
+                ensure!(
+                    packet(&mut bytes)? == Some(b"# service=git-receive-pack\n".as_slice()),
+                    "not a smart HTTP receive service"
+                );
+                ensure!(packet(&mut bytes)?.is_none(), "missing service flush");
+                let mut ad = Advertisement::new();
+                let mut count = 0;
+                while let Some(line) = packet(&mut bytes)? {
+                    ensure!(count < 100000, "too many refs");
+                    ad.line(line, count == 0)?;
+                    count += 1;
+                }
+                ensure!(
+                    bytes.is_empty() && ad.caps.contains("report-status"),
+                    "invalid receive advertisement or missing report-status"
+                );
+                Ok(Self::Http {
+                    client,
+                    base,
+                    name: name.into(),
+                    old: ad.refs.get(name).copied(),
+                    delete_refs: ad.caps.contains("delete-refs"),
+                })
+            }
+            _ => anyhow::bail!("push requires SSH or HTTP(S)"),
+        }
+    }
+    pub fn old(&self) -> Option<Oid> {
+        match self {
+            Self::Ssh(p) => p.old,
+            Self::Http { old, .. } => *old,
+        }
+    }
+    pub async fn unchanged(self) -> Result<()> {
+        match self {
+            Self::Ssh(p) => p.unchanged().await,
+            Self::Http { .. } => Ok(()),
+        }
+    }
+    pub async fn send(self, new: Oid, pack: Vec<u8>) -> Result<()> {
+        match self {
+            Self::Ssh(p) => p.send(new, pack).await,
+            Self::Http {
+                client,
+                base,
+                name,
+                old,
+                delete_refs,
+            } => {
+                ensure!(
+                    new != Oid::ZERO || delete_refs,
+                    "server does not allow deletion"
+                );
+                let mut request = crate::transport::packet(
+                    format!("{} {new} {name}\0report-status\n", old.unwrap_or(Oid::ZERO))
+                        .as_bytes(),
+                )?;
+                request.extend_from_slice(b"0000");
+                request.extend(pack);
+                let response =
+                    http_auth(client.post(service_url(&base, "git-receive-pack")?), &base)?
+                        .header(
+                            reqwest::header::CONTENT_TYPE,
+                            "application/x-git-receive-pack-request",
+                        )
+                        .header(
+                            reqwest::header::ACCEPT,
+                            "application/x-git-receive-pack-result",
+                        )
+                        .body(request)
+                        .send()
+                        .await?;
+                let data = body(
+                    response,
+                    "application/x-git-receive-pack-result",
+                    8 * 1024 * 1024,
+                )
+                .await?;
+                let mut bytes = data.as_slice();
+                ensure!(
+                    packet(&mut bytes)? == Some(b"unpack ok\n".as_slice()),
+                    "remote unpack failed"
+                );
+                let expected = format!("ok {name}\n");
+                ensure!(
+                    packet(&mut bytes)? == Some(expected.as_bytes()),
+                    "remote rejected push"
+                );
+                ensure!(packet(&mut bytes)?.is_none(), "unexpected extra ref status");
+                Ok(())
+            }
+        }
+    }
 }

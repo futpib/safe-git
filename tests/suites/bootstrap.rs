@@ -234,7 +234,7 @@ pub fn suite() {
             stderr: String::new()
         }
     );
-    safe(&["pull", &url]).fails();
+    safe(&["pull", &url]).run();
     safe(&["pull", "--ff-only", "--rebase", &url]).fails();
     safe(&["pull", "--ff-only", "--recurse-submodules", &url]).fails();
     let lock = fs::File::open(work.join(".git/.safe-git.lock")).unwrap();
@@ -246,7 +246,7 @@ pub fn suite() {
     );
     drop(lock);
     passed(
-        "pull requires ff-only, refuses rebase/submodule execution and concurrent lock; quiet no-op is silent",
+        "plain pull works, explicit ff-only refuses rebase/submodule execution and concurrent lock; quiet no-op is silent",
     );
 
     let tree = revision(&seed, "HEAD^{tree}");

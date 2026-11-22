@@ -315,6 +315,8 @@ pub struct Edit {
     pub after: Entries,
     pub index_before: Entries,
     pub index_after: Entries,
+    pub conflicts_before: index::Conflicts,
+    pub conflicts_after: index::Conflicts,
 }
 pub fn edit(repo: &Repo, store: &mut Store<'_>, edit: Edit) -> Result<()> {
     let head = edit.head.clone();
@@ -381,10 +383,20 @@ fn apply_inner(
     let mut index_lock = Pending::new(repo.root.try_clone()?, "index.lock".into())
         .context("acquire Git index lock")?;
     let original = repo.read("index", INDEX_LIMIT)?;
-    let mut index = match &original {
-        Some(bytes) => index::decode(bytes)?,
-        None => Entries::new(),
+    let (mut index, conflicts) = match &original {
+        Some(bytes) => index::decode_full(bytes)?,
+        None => Default::default(),
     };
+    ensure!(
+        conflicts.is_empty() || edit.is_some() || reset,
+        "unresolved conflicts"
+    );
+    if let Some(edit) = &edit {
+        ensure!(
+            conflicts == edit.conflicts_before,
+            "index conflicts changed concurrently"
+        );
+    }
     let before = if let Some(edit) = &edit {
         ensure!(head == edit.head, "HEAD changed concurrently");
         ensure!(index == edit.index_before, "index changed concurrently");
@@ -396,6 +408,7 @@ fn apply_inner(
         .keys()
         .chain(after.keys())
         .chain(index.keys())
+        .chain(conflicts.keys())
         .cloned()
         .collect();
     let mut changes = Vec::new();
@@ -458,11 +471,13 @@ fn apply_inner(
             index.remove(&path);
         }
     }
+    let mut conflicts_after = index::Conflicts::new();
     if let Some(edit) = edit {
         index = edit.index_after;
+        conflicts_after = edit.conflicts_after;
     }
     index::no_prefix_conflicts(&index)?;
-    let new_index = index::encode(&index)?;
+    let new_index = index::encode_full(&index, &conflicts_after)?;
     let journal = Journal {
         version: 2,
         head: head.clone(),

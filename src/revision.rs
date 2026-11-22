@@ -112,6 +112,27 @@ pub fn resolve(repo: &Repo, store: &mut Store<'_>, value: &str) -> Result<Oid> {
             .read_ref(&upstream(repo)?)?
             .context("upstream ref does not exist");
     }
+    if let Some((base, selector)) = value.strip_suffix('}').and_then(|v| v.rsplit_once("@{")) {
+        let n = selector
+            .parse::<usize>()
+            .context("invalid reflog selector")?;
+        let name = if base.is_empty() || base == "HEAD" {
+            "HEAD".to_owned()
+        } else if base.starts_with("refs/") {
+            base.into()
+        } else if base == "stash" {
+            "refs/stash".into()
+        } else {
+            format!("refs/heads/{}", crate::repo::branch(base)?)
+        };
+        let lines = crate::history::log_entries(repo, &name)?;
+        let line = lines
+            .iter()
+            .rev()
+            .nth(n)
+            .context("reflog entry does not exist")?;
+        return Oid::parse(&line[41..81]);
+    }
     if value == "FETCH_HEAD" {
         let bytes = repo
             .read("FETCH_HEAD", 8 * 1024 * 1024)?

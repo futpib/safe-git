@@ -3,6 +3,7 @@ mod checkout;
 mod clone;
 mod compat;
 mod config;
+mod history;
 mod ignore;
 mod index;
 mod network;
@@ -10,10 +11,13 @@ mod object;
 mod output;
 mod pack;
 mod packed;
+mod patch;
 mod porcelain;
 mod protocol;
+mod push;
 mod repo;
 mod revision;
+mod sequence;
 mod stash;
 mod transport;
 mod trust;
@@ -24,18 +28,20 @@ use clap::{Parser, Subcommand};
 use object::{Oid, ReadObjects, ancestor, commits, reachable, reachable_since};
 use repo::{Repo, Store};
 use std::{path::PathBuf, time::Duration};
-use transport::{Auth, Remote};
+use transport::Auth;
 
 #[derive(Parser)]
 #[command(
     version = env!("SAFE_GIT_VERSION"),
     about = "Git operations without repository-directed execution",
-    after_help = "Everyday commands: status, add, switch, restore, diff, log, commit, stash.\nAdditional commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, reset --hard, checkout, rebase, tag --list, rev-list, describe,\narchive --format tar. Unsupported options fail closed."
+    after_help = "Everyday commands: status, add, switch, restore, diff, log, commit, stash.\nAdditional commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, branch, reset, reflog, checkout, rebase, cherry-pick, revert, tag --list, rev-list, describe,\narchive --format tar. Unsupported options fail closed."
 )]
 struct Cli {
-    /// Working-tree root or bare repository; never discovers parent repositories
+    /// Repository or a directory within its working tree
     #[arg(short = 'C', default_value = ".", global = true)]
     repository: PathBuf,
+    #[arg(skip)]
+    prefix: PathBuf,
     /// Use only this private key instead of the host's agent and default keys
     #[arg(
         long,
@@ -89,12 +95,13 @@ enum Command {
         url: String,
         path: Option<PathBuf>,
     },
-    /// Create a new bare SHA-1 repository
+    /// Create a new SHA-1 repository
     Init {
-        #[arg(long, required = true)]
+        #[arg(long)]
         bare: bool,
-        #[arg(long, default_value = "main")]
+        #[arg(short = 'b', long, default_value = "main")]
         initial_branch: String,
+        #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Fetch one branch from an explicit SSH URL into a tracking ref
@@ -113,9 +120,9 @@ enum Command {
         #[arg(long)]
         tags: bool,
     },
-    /// Fetch one branch and fast-forward under one repository lock
+    /// Fetch one branch and integrate it without repository-selected commands
     Pull {
-        #[arg(long, required = true)]
+        #[arg(long)]
         ff_only: bool,
         /// Submodules are always inert; accepted for Git command compatibility
         #[arg(long)]
@@ -126,7 +133,7 @@ enum Command {
         /// Defaults to the current branch; repository upstream config is ignored
         branch: Option<String>,
     },
-    /// Fast-forward the current branch and update its working tree, if present
+    /// Merge a revision; conflicts can be continued or aborted
     Merge {
         #[arg(long)]
         ff_only: bool,
@@ -138,16 +145,28 @@ enum Command {
         no_ff: bool,
         #[arg(long)]
         no_commit: bool,
+        #[arg(long)]
+        r#continue: bool,
+        #[arg(long)]
+        abort: bool,
         reference: Option<String>,
     },
-    /// Push one local branch to one remote branch, fast-forward only
+    /// Push branches or tags to a caller-selected or host-registered endpoint
     Push {
         /// Remember the destination in trusted host state, never repository config
         #[arg(short = 'u', long)]
         set_upstream: bool,
         url: Option<String>,
         /// BRANCH or LOCAL:REMOTE; defaults to current HEAD branch
-        refspec: Option<String>,
+        refspec: Vec<String>,
+        #[arg(short, long)]
+        force: bool,
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        force_with_lease: Option<String>,
+        #[arg(long)]
+        delete: bool,
+        #[arg(long)]
+        tags: bool,
     },
     /// Recover an interrupted safe-git working-tree update from its verified backups
     Recover,
@@ -217,10 +236,18 @@ async fn run(cli: &Cli) -> Result<()> {
     if let Command::Init {
         path,
         initial_branch,
-        ..
+        bare,
     } = &cli.command
     {
-        Repo::init(path, initial_branch)?;
+        let path = cli.repository.join(path);
+        if *bare {
+            Repo::init(&path, initial_branch)?;
+        } else {
+            if !path.exists() {
+                std::fs::create_dir(&path)?;
+            }
+            Repo::init_worktree(&path, initial_branch)?;
+        }
         if !cli.quiet {
             println!(
                 "Initialized empty Git repository in {}/",
@@ -281,6 +308,7 @@ async fn run(cli: &Cli) -> Result<()> {
             url,
             branch,
             no_stat,
+            ff_only,
             ..
         } => {
             let head = repo.head()?;
@@ -303,7 +331,11 @@ async fn run(cli: &Cli) -> Result<()> {
             )
             .await?;
             ensure!(repo.head()? == head, "HEAD changed during pull; retry");
-            merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;
+            if *ff_only {
+                merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;
+            } else {
+                sequence::merge(cli, &repo, &mut store, incoming, false, false)?;
+            }
         }
         Command::Merge {
             reference,
@@ -311,8 +343,24 @@ async fn run(cli: &Cli) -> Result<()> {
             ff_only,
             no_ff,
             no_commit,
+            r#continue,
+            abort,
             ..
         } => {
+            if *r#continue || *abort {
+                ensure!(!(*r#continue && *abort), "incompatible merge controls");
+                return sequence::run(
+                    cli,
+                    &repo,
+                    &mut store,
+                    "merge",
+                    &[if *abort {
+                        "--abort".into()
+                    } else {
+                        "--continue".into()
+                    }],
+                );
+            }
             let reference = match reference {
                 Some(r) => r.clone(),
                 None => revision::upstream(&repo)?,
@@ -322,137 +370,34 @@ async fn run(cli: &Cli) -> Result<()> {
                 ensure!(!no_ff && !no_commit, "incompatible merge options");
                 merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;
             } else {
-                ensure!(
-                    *no_ff && *no_commit,
-                    "merge requires --ff-only or --no-ff --no-commit"
-                );
-                porcelain::review_merge(&repo, &mut store, incoming, cli.quiet)?;
+                sequence::merge(cli, &repo, &mut store, incoming, *no_commit, *no_ff)?;
             }
         }
         Command::Push {
             url,
             refspec,
             set_upstream,
+            force,
+            force_with_lease,
+            delete,
+            tags,
         } => {
-            let head = repo.head()?;
-            let default = head.strip_prefix("refs/heads/").context("invalid HEAD")?;
-            let endpoint = trust::endpoint(&repo, url.as_deref(), cli.remote_url.as_deref())?;
-            let endpoint = network::normalize_from(&endpoint, &cli.repository)?;
-            let mut binding = trust::get(&repo)?;
-            let remembered = binding
-                .as_ref()
-                .filter(|b| b.url == endpoint)
-                .and_then(|b| b.upstreams.get(default))
-                .map(|dest| format!("{default}:{dest}"));
-            let spec = refspec
-                .as_deref()
-                .or(remembered.as_deref())
-                .unwrap_or(default);
-            let (local, dest) = spec.split_once(':').unwrap_or((spec, spec));
-            let local = repo::branch(local)?;
-            let dest = repo::branch(dest)?;
-            let tip = repo
-                .read_ref(&format!("refs/heads/{local}"))?
-                .context("local branch does not exist")?;
-            store.get(tip)?.commit()?;
-            let remote = Remote::parse(&endpoint)?;
-            if *set_upstream {
-                let b = binding.get_or_insert_with(|| trust::Binding {
-                    url: endpoint.clone(),
-                    remote: url
-                        .as_deref()
-                        .filter(|v| !v.contains([':', '/']))
-                        .unwrap_or("origin")
-                        .into(),
-                    branch: local.clone(),
-                    single: false,
-                    mirror: false,
-                    bare: repo.worktree.is_none(),
-                    upstreams: Default::default(),
-                });
-                if b.url != endpoint {
-                    b.upstreams.clear();
-                }
-                b.url = endpoint.clone();
-                b.upstreams.insert(local.clone(), dest.clone());
-                ensure!(
-                    serde_json::to_vec(b)?.len() <= 16384,
-                    "host endpoint record exceeds limit"
-                );
-            }
-            let auth = cli.auth()?;
-            let push = protocol::Push::prepare(&remote, &auth, &dest).await?;
-            if push.old == Some(tip) {
-                push.unchanged().await?;
-                if *set_upstream {
-                    trust::save(&repo, binding.as_ref().unwrap())?;
-                }
-                pushed_tracking_ref(&repo, binding.as_ref(), &endpoint, &dest, tip)?;
-                if !cli.quiet {
-                    eprintln!("Everything up-to-date");
-                }
-                return Ok(());
-            }
-            let destination = push.old;
-            // No live SSH channel while potentially expensive local object work
-            // runs. Re-advertise and compare the destination again before sending.
-            push.unchanged().await?;
-            if let Some(old) = destination {
-                match store.get(old) {
-                    Ok(_) => {}
-                    Err(e) if e.downcast_ref::<repo::MissingObject>().is_some() => {
-                        let (_, objects) =
-                            protocol::fetch(&remote, &auth, &dest, Some(old), &[tip]).await?;
-                        store.add(objects)?;
-                    }
-                    Err(e) => return Err(e),
-                }
-                store.get(old)?.commit()?;
-                ensure!(
-                    ancestor(&mut store, old, tip)?,
-                    "non-fast-forward push refused; destination is unchanged"
-                );
-            }
-            let boundary = commits(&mut store, &destination.into_iter().collect::<Vec<_>>())?;
-            let ids = reachable_since(&mut store, tip, &boundary)?;
-            let objects = ids
-                .into_iter()
-                .map(|id| store.get(id))
-                .collect::<Result<Vec<_>>>()?;
-            let pack = pack::encode(&objects)?;
-            let push = protocol::Push::prepare(&remote, &auth, &dest).await?;
-            ensure!(
-                push.old == destination,
-                "push rejected: destination changed while preparing transfer; retry"
-            );
-            push.send(tip, pack).await?;
-            if *set_upstream {
-                trust::save(&repo, binding.as_ref().unwrap())?;
-            }
-            pushed_tracking_ref(&repo, binding.as_ref(), &endpoint, &dest, tip)?;
-            if !cli.quiet {
-                eprint!(
-                    "{}",
-                    output::push(&endpoint, &local, &dest, destination, tip)
-                );
-            }
+            push::run(
+                cli,
+                &repo,
+                &mut store,
+                push::Options {
+                    url: url.as_deref(),
+                    specs: refspec,
+                    upstream: *set_upstream,
+                    force: *force,
+                    lease: force_with_lease.as_deref(),
+                    delete: *delete,
+                    tags: *tags,
+                },
+            )
+            .await?;
         }
-    }
-    Ok(())
-}
-
-fn pushed_tracking_ref(
-    repo: &Repo,
-    binding: Option<&trust::Binding>,
-    endpoint: &str,
-    branch: &str,
-    tip: Oid,
-) -> Result<()> {
-    if let Some(binding) = binding.filter(|b| b.url == endpoint && !b.bare) {
-        let reference = repo::tracking(&binding.remote, branch)?;
-        let old = repo.read_ref(&reference)?;
-        repo.update_ref(&reference, old, tip)
-            .context("push succeeded, but updating the local tracking ref failed")?;
     }
     Ok(())
 }
@@ -589,11 +534,16 @@ fn merge(
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
-    let result = tokio::time::timeout(Duration::from_secs(cli.timeout), run(&cli))
-        .await
-        .context("operation timed out")
-        .and_then(|r| r);
+    let mut cli = Cli::parse();
+    let location = locate(&mut cli);
+    let result = if let Err(e) = location {
+        Err(e)
+    } else {
+        tokio::time::timeout(Duration::from_secs(cli.timeout), run(&cli))
+            .await
+            .context("operation timed out")
+            .and_then(|r| r)
+    };
     if let Err(error) = result {
         if let Some(status) = error.downcast_ref::<compat::Exit>() {
             std::process::exit(status.0);
@@ -601,5 +551,25 @@ async fn main() {
         // Escape all diagnostics so server/repository strings cannot control the terminal.
         eprintln!("fatal: {}", format!("{error:#}").escape_debug());
         std::process::exit(128);
+    }
+}
+
+fn locate(cli: &mut Cli) -> Result<()> {
+    if matches!(cli.command, Command::Init { .. } | Command::Clone { .. })
+        || matches!(&cli.command,Command::Compatibility(args) if args.first().is_some_and(|a| a == "ls-remote"))
+    {
+        return Ok(());
+    }
+    let start = std::env::current_dir()?.join(&cli.repository);
+    let mut candidate = start.as_path();
+    loop {
+        if std::fs::symlink_metadata(candidate.join(".git")).is_ok()
+            || (candidate.join("HEAD").is_file() && candidate.join("objects").is_dir())
+        {
+            cli.prefix = start.strip_prefix(candidate)?.to_owned();
+            cli.repository = candidate.to_owned();
+            return Ok(());
+        }
+        candidate = candidate.parent().context("no repository found")?;
     }
 }
