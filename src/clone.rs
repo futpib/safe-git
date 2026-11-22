@@ -204,6 +204,7 @@ pub async fn run(
             single: options.single,
             mirror: options.mirror,
             bare: options.bare,
+            upstreams: Default::default(),
         },
     )?;
     Ok(())

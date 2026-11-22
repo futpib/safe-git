@@ -83,7 +83,7 @@ pub fn write_tree(repo: &Repo, entries: &Entries) -> Result<Oid> {
         0,
     )
 }
-fn identity(repo: &Repo, overrides: &[String], role: &str) -> Result<String> {
+pub(crate) fn identity(repo: &Repo, overrides: &[String], role: &str) -> Result<String> {
     let name = std::env::var(format!("GIT_{role}_NAME"))
         .ok()
         .or(config::get(repo, overrides, "user.name")?)
@@ -117,7 +117,7 @@ fn identity(repo: &Repo, overrides: &[String], role: &str) -> Result<String> {
     );
     Ok(format!("{name} <{email}> {} {}", parts[0], parts[1]))
 }
-fn new_commit(
+pub(crate) fn new_commit(
     repo: &Repo,
     tree: Oid,
     parents: &[Oid],
@@ -339,7 +339,7 @@ fn blob(store: &mut Store<'_>, entry: Entry, budget: &mut usize) -> Result<Vec<u
     *budget -= object.data.len();
     Ok(object.data.clone())
 }
-fn three_way(
+pub(crate) fn three_way(
     repo: &Repo,
     store: &mut Store<'_>,
     base: &Entries,

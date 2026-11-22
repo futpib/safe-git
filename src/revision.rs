@@ -23,6 +23,16 @@ pub fn upstream(repo: &Repo) -> Result<String> {
     let branch = head
         .strip_prefix("refs/heads/")
         .context("detached HEAD has no upstream")?;
+    if let Some(binding) = crate::trust::get(repo)? {
+        return crate::repo::tracking(
+            &binding.remote,
+            binding
+                .upstreams
+                .get(branch)
+                .map(String::as_str)
+                .unwrap_or(branch),
+        );
+    }
     let cfg = config::local(repo)?;
     let remote = cfg
         .get(&format!("branch.{branch}.remote"))

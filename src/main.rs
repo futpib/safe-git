@@ -3,6 +3,7 @@ mod checkout;
 mod clone;
 mod compat;
 mod config;
+mod ignore;
 mod index;
 mod network;
 mod object;
@@ -13,8 +14,10 @@ mod porcelain;
 mod protocol;
 mod repo;
 mod revision;
+mod stash;
 mod transport;
 mod trust;
+mod workflow;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -27,7 +30,7 @@ use transport::{Auth, Remote};
 #[command(
     version = env!("SAFE_GIT_VERSION"),
     about = "Git operations without repository-directed execution",
-    after_help = "Package-manager commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, reset --hard, checkout, rebase, diff, log, commit, tag --list,\nrev-list, describe, archive --format tar. Unsupported options fail closed."
+    after_help = "Everyday commands: status, add, switch, restore, diff, log, commit, stash.\nAdditional commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, reset --hard, checkout, rebase, tag --list, rev-list, describe,\narchive --format tar. Unsupported options fail closed."
 )]
 struct Cli {
     /// Working-tree root or bare repository; never discovers parent repositories
@@ -139,6 +142,9 @@ enum Command {
     },
     /// Push one local branch to one remote branch, fast-forward only
     Push {
+        /// Remember the destination in trusted host state, never repository config
+        #[arg(short = 'u', long)]
+        set_upstream: bool,
         url: Option<String>,
         /// BRANCH or LOCAL:REMOTE; defaults to current HEAD branch
         refspec: Option<String>,
@@ -151,12 +157,6 @@ enum Command {
 }
 
 impl Cli {
-    fn url<'a>(&'a self, positional: Option<&'a str>) -> Result<&'a str> {
-        positional.or(self.remote_url.as_deref()).context("provide a URL, --url, or SAFE_GIT_URL; repository remote configuration is not consulted")
-    }
-    fn endpoint(&self, positional: Option<&str>) -> Result<Remote> {
-        Remote::parse(self.url(positional)?)
-    }
     fn auth(&self) -> Result<Auth> {
         let known_hosts = self
             .known_hosts
@@ -284,12 +284,21 @@ async fn run(cli: &Cli) -> Result<()> {
             ..
         } => {
             let head = repo.head()?;
+            let binding = trust::get(&repo)?;
+            let endpoint = trust::endpoint(&repo, url.as_deref(), cli.remote_url.as_deref())?;
+            let default_branch = binding
+                .as_ref()
+                .filter(|b| b.url == endpoint)
+                .and_then(|b| {
+                    head.strip_prefix("refs/heads/")
+                        .and_then(|h| b.upstreams.get(h))
+                });
             let incoming = fetch(
                 cli,
                 &repo,
                 &mut store,
                 url.as_deref(),
-                branch.as_deref(),
+                branch.as_deref().or(default_branch.map(String::as_str)),
                 None,
             )
             .await?;
@@ -320,10 +329,25 @@ async fn run(cli: &Cli) -> Result<()> {
                 porcelain::review_merge(&repo, &mut store, incoming, cli.quiet)?;
             }
         }
-        Command::Push { url, refspec } => {
+        Command::Push {
+            url,
+            refspec,
+            set_upstream,
+        } => {
             let head = repo.head()?;
             let default = head.strip_prefix("refs/heads/").context("invalid HEAD")?;
-            let spec = refspec.as_deref().unwrap_or(default);
+            let endpoint = trust::endpoint(&repo, url.as_deref(), cli.remote_url.as_deref())?;
+            let endpoint = network::normalize_from(&endpoint, &cli.repository)?;
+            let mut binding = trust::get(&repo)?;
+            let remembered = binding
+                .as_ref()
+                .filter(|b| b.url == endpoint)
+                .and_then(|b| b.upstreams.get(default))
+                .map(|dest| format!("{default}:{dest}"));
+            let spec = refspec
+                .as_deref()
+                .or(remembered.as_deref())
+                .unwrap_or(default);
             let (local, dest) = spec.split_once(':').unwrap_or((spec, spec));
             let local = repo::branch(local)?;
             let dest = repo::branch(dest)?;
@@ -331,11 +355,39 @@ async fn run(cli: &Cli) -> Result<()> {
                 .read_ref(&format!("refs/heads/{local}"))?
                 .context("local branch does not exist")?;
             store.get(tip)?.commit()?;
-            let remote = cli.endpoint(url.as_deref())?;
+            let remote = Remote::parse(&endpoint)?;
+            if *set_upstream {
+                let b = binding.get_or_insert_with(|| trust::Binding {
+                    url: endpoint.clone(),
+                    remote: url
+                        .as_deref()
+                        .filter(|v| !v.contains([':', '/']))
+                        .unwrap_or("origin")
+                        .into(),
+                    branch: local.clone(),
+                    single: false,
+                    mirror: false,
+                    bare: repo.worktree.is_none(),
+                    upstreams: Default::default(),
+                });
+                if b.url != endpoint {
+                    b.upstreams.clear();
+                }
+                b.url = endpoint.clone();
+                b.upstreams.insert(local.clone(), dest.clone());
+                ensure!(
+                    serde_json::to_vec(b)?.len() <= 16384,
+                    "host endpoint record exceeds limit"
+                );
+            }
             let auth = cli.auth()?;
             let push = protocol::Push::prepare(&remote, &auth, &dest).await?;
             if push.old == Some(tip) {
                 push.unchanged().await?;
+                if *set_upstream {
+                    trust::save(&repo, binding.as_ref().unwrap())?;
+                }
+                pushed_tracking_ref(&repo, binding.as_ref(), &endpoint, &dest, tip)?;
                 if !cli.quiet {
                     eprintln!("Everything up-to-date");
                 }
@@ -374,13 +426,33 @@ async fn run(cli: &Cli) -> Result<()> {
                 "push rejected: destination changed while preparing transfer; retry"
             );
             push.send(tip, pack).await?;
+            if *set_upstream {
+                trust::save(&repo, binding.as_ref().unwrap())?;
+            }
+            pushed_tracking_ref(&repo, binding.as_ref(), &endpoint, &dest, tip)?;
             if !cli.quiet {
                 eprint!(
                     "{}",
-                    output::push(cli.url(url.as_deref())?, &local, &dest, destination, tip)
+                    output::push(&endpoint, &local, &dest, destination, tip)
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn pushed_tracking_ref(
+    repo: &Repo,
+    binding: Option<&trust::Binding>,
+    endpoint: &str,
+    branch: &str,
+    tip: Oid,
+) -> Result<()> {
+    if let Some(binding) = binding.filter(|b| b.url == endpoint && !b.bare) {
+        let reference = repo::tracking(&binding.remote, branch)?;
+        let old = repo.read_ref(&reference)?;
+        repo.update_ref(&reference, old, tip)
+            .context("push succeeded, but updating the local tracking ref failed")?;
     }
     Ok(())
 }
@@ -411,7 +483,8 @@ async fn fetch(
         }
     }
     let boundary = commits(store, &haves)?;
-    let endpoint = network::normalize_from(cli.url(url)?, &cli.repository)?;
+    let endpoint = trust::endpoint(repo, url, cli.remote_url.as_deref())?;
+    let endpoint = network::normalize_from(&endpoint, &cli.repository)?;
     let ad = network::discover(&endpoint, &cli.auth()?).await?;
     let tip = ad.branch(&branch).context("remote branch does not exist")?;
     let objects = network::fetch(
@@ -436,17 +509,17 @@ async fn fetch(
     } else {
         repo.atomic(
             "FETCH_HEAD",
-            format!("{tip}\t\tbranch '{branch}' of {}\n", cli.url(url)?).as_bytes(),
+            format!("{tip}\t\tbranch '{branch}' of {endpoint}\n").as_bytes(),
         )?;
     }
     if !cli.quiet {
         if let Some(remote) = remote {
             eprint!(
                 "{}",
-                output::fetch(cli.url(url)?, &branch, remote, old, tip, fast_forward)
+                output::fetch(&endpoint, &branch, remote, old, tip, fast_forward)
             );
         } else {
-            eprint!("{}", output::pull_fetch(cli.url(url)?, &branch));
+            eprint!("{}", output::pull_fetch(&endpoint, &branch));
         }
     }
     Ok(tip)

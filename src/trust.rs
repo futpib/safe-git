@@ -19,6 +19,8 @@ pub struct Binding {
     pub single: bool,
     pub mirror: bool,
     pub bare: bool,
+    #[serde(default)]
+    pub upstreams: std::collections::BTreeMap<String, String>,
 }
 fn path(repo: &Repo) -> Result<PathBuf> {
     let directory = std::env::var_os("SAFE_GIT_STATE_DIR")
@@ -67,16 +69,45 @@ pub fn get(repo: &Repo) -> Result<Option<Binding>> {
     ensure!(data.len() <= 16384, "host endpoint record exceeds limit");
     let binding: Binding = serde_json::from_slice(&data)?;
     crate::repo::tracking(&binding.remote, &binding.branch)?;
+    for (local, remote) in &binding.upstreams {
+        crate::repo::branch(local)?;
+        crate::repo::branch(remote)?;
+    }
     Ok(Some(binding))
 }
 pub fn save(repo: &Repo, binding: &Binding) -> Result<()> {
     let path = path(repo)?;
     let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-    file.write_all(&serde_json::to_vec(binding)?)?;
+    let bytes = serde_json::to_vec(binding)?;
+    ensure!(bytes.len() <= 16384, "host endpoint record exceeds limit");
+    file.write_all(&bytes)?;
     file.as_file().sync_all()?;
     file.persist(&path)?;
     File::open(path.parent().unwrap())?.sync_all()?;
     Ok(())
+}
+/// Resolve only caller input and the external trust record. Repository config,
+/// pushurl, URL rewrites and branch settings never select a network destination.
+pub fn endpoint(repo: &Repo, positional: Option<&str>, explicit: Option<&str>) -> Result<String> {
+    match positional {
+        Some(value) => {
+            match get(repo)? {
+                Some(binding) if value == binding.remote => {
+                    return Ok(explicit.unwrap_or(&binding.url).to_owned());
+                }
+                None if !value.contains([':', '/']) && explicit.is_some() => {
+                    crate::repo::tracking(value, "main")?;
+                    return Ok(explicit.unwrap().to_owned());
+                }
+                _ => {}
+            }
+            Ok(value.to_owned())
+        }
+        None => match explicit {
+            Some(value) => Ok(value.to_owned()),
+            None => Ok(require(repo)?.url),
+        },
+    }
 }
 pub fn require(repo: &Repo) -> Result<Binding> {
     get(repo)?.context("provide a URL, --url, or SAFE_GIT_URL; repository remote configuration is not consulted (clone with safe-git or explicitly register the endpoint with safe-git config remote.origin.url URL)")

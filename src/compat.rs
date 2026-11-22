@@ -200,7 +200,11 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             "rev-list",
             "describe",
             "archive",
-            "status"
+            "status",
+            "add",
+            "switch",
+            "restore",
+            "stash"
         ]
         .contains(&name),
         "unsupported Git command {name}; no external fallback is implemented"
@@ -209,6 +213,9 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
     ready(&repo)?;
     let mut store = Store::new(&repo);
     match name {
+        "status" | "add" | "switch" | "restore" | "stash" => {
+            crate::workflow::run(cli, &repo, &mut store, name, items)
+        }
         "config" => {
             let pos = args(items, &["--get", "--local"])?;
             ensure!(
@@ -806,7 +813,17 @@ fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Result<()> {
             }
             diff_budget(&old, &new)?;
             let patch = diffy::create_patch_bytes(&old, &new).to_bytes();
-            output.push_str(&format!("--- {ap}\n+++ {bp}\n"));
+            let a_tab = if !ap.starts_with('"') && ap.contains(' ') {
+                "\t"
+            } else {
+                ""
+            };
+            let b_tab = if !bp.starts_with('"') && bp.contains(' ') {
+                "\t"
+            } else {
+                ""
+            };
+            output.push_str(&format!("--- {ap}{a_tab}\n+++ {bp}{b_tab}\n"));
             let mut lines = patch.split_inclusive(|b| *b == b'\n');
             lines.next();
             lines.next();
@@ -854,6 +871,23 @@ fn timezone(zone: &str) -> Result<time::UtcOffset> {
     )?)
 }
 fn history(repo: &Repo, store: &mut Store<'_>, items: &[String], list: bool) -> Result<()> {
+    let mut normalized = Vec::new();
+    let mut input = items.iter();
+    while let Some(item) = input.next() {
+        if item == "-n" || item == "--max-count" {
+            let count = input.next().context("missing history count")?;
+            count.parse::<usize>().context("invalid history count")?;
+            normalized.push(format!("--max-count={count}"));
+        } else if item.starts_with('-')
+            && item.len() > 1
+            && item[1..].bytes().all(|b| b.is_ascii_digit())
+        {
+            normalized.push(format!("--max-count={}", &item[1..]));
+        } else {
+            normalized.push(item.clone());
+        }
+    }
+    let items = &normalized;
     let pos = args(
         items,
         &[

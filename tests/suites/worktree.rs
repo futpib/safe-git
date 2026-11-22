@@ -313,16 +313,27 @@ pub fn suite() {
     assert!(!txn.exists() && !work.join(".git/index.lock").exists());
     assert!(git(&work).args(["status", "--porcelain"]).run().is_empty());
     passed("SIGKILL mid-checkout preserves backups; recover restores files, index, and locks");
-    for operation in ["reset-same", "switch-existing"] {
+    for operation in ["reset-same", "switch-existing", "stash"] {
         let work = clone();
-        let command = if operation == "reset-same" {
+        let command = if operation == "reset-same" || operation == "stash" {
             for i in 0..300 {
                 write(
                     work.join(format!("bulk-{i:03}")),
                     "user edit before reset\n",
                 );
             }
-            vec!["reset", "--hard", "HEAD"]
+            if operation == "stash" {
+                fixture.safe(&work).args(["add", "bulk-000"]).run();
+                vec![
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "stash",
+                ]
+            } else {
+                vec!["reset", "--hard", "HEAD"]
+            }
         } else {
             git(&work).args(["branch", "target", &forward]).run();
             vec!["checkout", "--force", "target"]
@@ -357,7 +368,7 @@ pub fn suite() {
         assert!(!work.join(".git/HEAD.lock").exists());
         assert!(!txn.exists());
         fixture.safe(&work).args(&command).run();
-        if operation == "reset-same" {
+        if operation == "reset-same" || operation == "stash" {
             assert_eq!(read(work.join("bulk-000")), "old\n");
         } else {
             assert_eq!(revision(&work, "HEAD"), forward);
@@ -365,6 +376,6 @@ pub fn suite() {
         }
     }
     passed(
-        "interrupted equal-tip hard reset and branch switch roll back files/index/HEAD and release locks",
+        "interrupted hard reset, branch switch and stash roll back files/index/HEAD and release locks",
     );
 }

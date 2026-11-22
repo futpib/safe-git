@@ -160,12 +160,17 @@ pub fn set(repo: &Repo, key: &str, new: &str, directory: &std::path::Path) -> Re
             single: false,
             mirror: false,
             bare: repo.worktree.is_none(),
+            upstreams: Default::default(),
         });
         ensure!(
             binding.remote == remote,
             "only the registered remote is supported"
         );
-        binding.url = crate::network::normalize_from(new, directory)?;
+        let endpoint = crate::network::normalize_from(new, directory)?;
+        if endpoint != binding.url {
+            binding.upstreams.clear();
+        }
+        binding.url = endpoint;
         trust::save(repo, &binding)?;
     }
     repo.atomic("config", &bytes)

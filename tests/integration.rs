@@ -12,6 +12,8 @@ mod packages;
 mod support;
 #[path = "suites/transfers.rs"]
 mod transfers;
+#[path = "suites/workflow.rs"]
+mod workflow;
 #[path = "suites/worktree.rs"]
 mod worktree;
 
@@ -29,6 +31,18 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("workflow_ignores", || {
+                workflow::ignores();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("workflow", || {
+                workflow::suite();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("workflow_network", || {
+                workflow::network();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("http_packages", || {
                 http_packages::suite();
                 Ok(())

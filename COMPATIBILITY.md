@@ -1,5 +1,14 @@
 # Package-manager compatibility
 
+Everyday commands also include `status` (short/porcelain v1), `add` (paths,
+directories, `-A`, `-u`, `-f`), `switch` (`-c`, `-C`, `--detach`), `restore`
+(`--staged`, `--worktree`, `--source`), and tracked-file `stash`/`stash pop`
+(`--index`, plus `list`, `apply`, and dropping the latest entry). Paths are
+literal and relative to the repository root. Stash conflicts leave files and
+the saved entry unchanged. `.gitignore` and `.git/info/exclude` are inert data;
+repository-configured global excludes and filters are ignored. Unsupported
+POSIX character classes in ignore patterns fail before staging files.
+
 Supported: paru's AUR clone/fetch, review diff, seen marker, saved-edit commit
 and clean rebase; makepkg's Git mirror, prune, local clone, tag/branch/commit
 checkout and tar checksum workflow. `rev-list --count`, `rev-parse --short`,
@@ -31,7 +40,10 @@ Deliberate differences:
   submodule commands and sequencer scripts are not implemented.
 - Merge/rebase conflicts and local merge-commit rebases fail before changing the
   checkout. Review merges require `--no-ff --no-commit`; ordinary merges require
-  `--ff-only`. Push still requires an explicit SSH endpoint and is fast-forward only.
+  `--ff-only`. Push uses SSH and is fast-forward only. `push -u origin BRANCH`
+  resolves only a host-registered or caller-supplied endpoint; its branch mapping is stored
+  outside the repository for subsequent push/pull. Repository `pushurl`, URL
+  rewrites and upstream settings cannot redirect these transfers.
 - Checkout/reset reject unsafe paths, escaping symlinks, external hard links,
   file/directory transitions and unsupported index/metadata formats. Commands
   operate at the repository root and retain bounded parsing/traversal budgets.

@@ -306,7 +306,43 @@ pub struct Update<'a> {
     pub head_after: Option<String>,
     pub reset: bool,
 }
+/// A worktree/index edit that leaves HEAD unchanged. Both snapshots are checked
+/// under the checkout locks before any paths are replaced.
+pub struct Edit {
+    pub head: String,
+    pub tip: Oid,
+    pub before: Entries,
+    pub after: Entries,
+    pub index_before: Entries,
+    pub index_after: Entries,
+}
+pub fn edit(repo: &Repo, store: &mut Store<'_>, edit: Edit) -> Result<()> {
+    let head = edit.head.clone();
+    let tip = edit.tip;
+    apply_inner(
+        repo,
+        store,
+        Update {
+            reference: &head,
+            old: Some(tip),
+            new: tip,
+            after: edit.after.clone(),
+            force: false,
+            head_after: None,
+            reset: false,
+        },
+        Some(edit),
+    )
+}
 pub fn apply(repo: &Repo, store: &mut Store<'_>, update: Update<'_>) -> Result<()> {
+    apply_inner(repo, store, update, None)
+}
+fn apply_inner(
+    repo: &Repo,
+    store: &mut Store<'_>,
+    update: Update<'_>,
+    edit: Option<Edit>,
+) -> Result<()> {
     let Update {
         reference,
         old,
@@ -349,7 +385,13 @@ pub fn apply(repo: &Repo, store: &mut Store<'_>, update: Update<'_>) -> Result<(
         Some(bytes) => index::decode(bytes)?,
         None => Entries::new(),
     };
-    let before = index::tree(store, repo.read_ref(&head)?)?;
+    let before = if let Some(edit) = &edit {
+        ensure!(head == edit.head, "HEAD changed concurrently");
+        ensure!(index == edit.index_before, "index changed concurrently");
+        edit.before.clone()
+    } else {
+        index::tree(store, repo.read_ref(&head)?)?
+    };
     let keys: BTreeSet<_> = before
         .keys()
         .chain(after.keys())
@@ -364,11 +406,11 @@ pub fn apply(repo: &Repo, store: &mut Store<'_>, update: Update<'_>) -> Result<(
         let a = before.get(&path).copied();
         let b = after.get(&path).copied();
         let staged = index.get(&path).copied();
-        if !force && (a == b || staged == b) {
+        if edit.is_none() && !force && (a == b || staged == b) {
             continue;
         }
         ensure!(
-            force || staged == a,
+            edit.is_some() || force || staged == a,
             "staged changes would be overwritten at {:?}",
             String::from_utf8_lossy(&path)
         );
@@ -415,6 +457,9 @@ pub fn apply(repo: &Repo, store: &mut Store<'_>, update: Update<'_>) -> Result<(
         } else {
             index.remove(&path);
         }
+    }
+    if let Some(edit) = edit {
+        index = edit.index_after;
     }
     index::no_prefix_conflicts(&index)?;
     let new_index = index::encode(&index)?;
@@ -507,6 +552,10 @@ pub fn apply(repo: &Repo, store: &mut Store<'_>, update: Update<'_>) -> Result<(
         ensure!(
             repo.read("HEAD", 2048)?.as_deref() == Some(head_before.as_slice()),
             "HEAD changed during checkout"
+        );
+        ensure!(
+            repo.read("index", INDEX_LIMIT)? == original,
+            "index changed during checkout"
         );
         index_lock.file.write_all(&new_index)?;
         index_lock.commit("index")?;

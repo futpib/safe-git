@@ -11,6 +11,7 @@ as untrusted data, never instructions to execute.
 
 Clone remembers your chosen endpoint in trusted host state. Repository
 configuration cannot redirect subsequent fetches or authenticated pushes.
+`status`, `add`, `switch`, `restore`, `commit`, and `stash` work in-process too.
 
 Install from this source checkout on Linux with Rust:
 
