@@ -113,6 +113,7 @@ fn entry_at(dir: &File, name: &[u8], device: u64) -> Result<Option<Entry>> {
     let kind = stat.st_mode & 0o170000;
     if kind == 0o40000 {
         return Ok(Some(Entry {
+            flags: 0,
             mode: 0o40000,
             oid: Oid::ZERO,
         }));
@@ -153,6 +154,7 @@ fn entry_at(dir: &File, name: &[u8], device: u64) -> Result<Option<Entry>> {
         _ => bail!("special worktree files are unsupported"),
     };
     Ok(Some(Entry {
+        flags: 0,
         mode,
         oid: Object {
             kind: Kind::Blob,
@@ -344,7 +346,7 @@ fn apply_inner(
     repo: &Repo,
     store: &mut Store<'_>,
     update: Update<'_>,
-    edit: Option<Edit>,
+    mut edit: Option<Edit>,
 ) -> Result<()> {
     let Update {
         reference,
@@ -400,7 +402,11 @@ fn apply_inner(
     }
     let before = if let Some(edit) = &edit {
         ensure!(head == edit.head, "HEAD changed concurrently");
-        ensure!(index == edit.index_before, "index changed concurrently");
+        ensure!(
+            index::encode_full(&index, &conflicts)?
+                == index::encode_full(&edit.index_before, &edit.conflicts_before)?,
+            "index changed concurrently"
+        );
         edit.before.clone()
     } else {
         index::tree(store, repo.read_ref(&head)?)?
@@ -416,15 +422,61 @@ fn apply_inner(
     let mut contents = Vec::<Option<Arc<Object>>>::new();
     let mut dirs = BTreeSet::new();
     let mut total = 0;
+    let mut sparse = if edit.is_none() {
+        crate::sparse::read(repo)?
+    } else {
+        None
+    };
     for path in keys {
-        let a = before.get(&path).copied();
-        let b = after.get(&path).copied();
+        let mut a = before.get(&path).copied();
+        let mut b = after.get(&path).copied();
         let staged = index.get(&path).copied();
-        if edit.is_none() && !force && (a == b || staged == b) {
+        if let Some(edit) = &mut edit
+            && a.is_some_and(|e| e.flags & index::SKIP != 0)
+            && work.state(&path)?.is_none()
+        {
+            if let Some(entry) = edit.index_after.get_mut(&path) {
+                entry.flags |= index::SKIP;
+            }
+            continue;
+        }
+        if edit.is_none() {
+            let included = match &mut sparse {
+                Some(s) => s.includes(&path)?,
+                None => true,
+            };
+            if !included && work.state(&path)?.is_none() {
+                ensure!(
+                    force || staged == a || staged == b,
+                    "staged changes outside sparse checkout would be overwritten"
+                );
+                if let Some(mut entry) = b {
+                    entry.flags |= index::SKIP;
+                    index.insert(path, entry);
+                } else {
+                    index.remove(&path);
+                }
+                continue;
+            }
+            if staged.is_some_and(|e| e.flags & index::SKIP != 0) && work.state(&path)?.is_none() {
+                a = None;
+            }
+            if let Some(e) = &mut b {
+                e.flags &= !index::SKIP;
+            }
+        }
+        if edit.is_none()
+            && !force
+            && (a == b || staged == b)
+            && staged.is_none_or(|e| e.flags & index::SKIP == 0)
+        {
             continue;
         }
         ensure!(
-            edit.is_some() || force || staged == a,
+            edit.is_some()
+                || force
+                || staged == a
+                || staged.is_some_and(|e| e.flags & index::SKIP != 0),
             "staged changes would be overwritten at {:?}",
             String::from_utf8_lossy(&path)
         );
@@ -619,6 +671,10 @@ pub fn snapshot(repo: &Repo, entries: &Entries) -> Result<Entries> {
     let mut result = Entries::new();
     let mut total = 0;
     for (path, entry) in entries {
+        if entry.flags & index::SKIP != 0 && work.state(path)?.is_none() {
+            result.insert(path.clone(), *entry);
+            continue;
+        }
         if entry.mode == 0o160000 {
             result.insert(path.clone(), *entry);
             continue;

@@ -216,6 +216,19 @@ pub async fn fetch(
 ) -> Result<Objects> {
     Ok(fetch_depth(url, auth, refs, haves, None).await?.objects)
 }
+#[derive(Default)]
+pub struct FetchOptions {
+    pub depth: Option<u32>,
+    pub deepen: Option<u32>,
+    pub shallow: HashSet<Oid>,
+    pub filter: Option<String>,
+    pub raw: bool,
+}
+impl FetchOptions {
+    pub fn changes_depth(&self) -> bool {
+        self.depth.is_some() || self.deepen.is_some()
+    }
+}
 pub struct Fetched {
     pub objects: Objects,
     pub shallow: HashSet<Oid>,
@@ -227,7 +240,34 @@ pub async fn fetch_depth(
     haves: &[Oid],
     depth: Option<u32>,
 ) -> Result<Fetched> {
-    let haves = if depth.is_some() { &[][..] } else { haves };
+    fetch_options(
+        url,
+        auth,
+        refs,
+        haves,
+        &FetchOptions {
+            depth,
+            ..Default::default()
+        },
+    )
+    .await
+}
+pub async fn fetch_options(
+    url: &str,
+    auth: &Auth,
+    refs: &HashMap<String, Oid>,
+    haves: &[Oid],
+    options: &FetchOptions,
+) -> Result<Fetched> {
+    if let Some(filter) = &options.filter {
+        crate::partial::filter(filter)?;
+    }
+    let haves =
+        if options.changes_depth() || options.filter.is_some() || !options.shallow.is_empty() {
+            &[][..]
+        } else {
+            haves
+        };
     if refs.is_empty() {
         return Ok(Fetched {
             objects: Objects::new(),
@@ -235,28 +275,23 @@ pub async fn fetch_depth(
         });
     }
     match endpoint(url)? {
-        Endpoint::Ssh(remote) => {
-            if let Some(depth) = depth {
-                protocol::fetch_depth(&remote, auth, refs, depth).await
-            } else {
-                Ok(Fetched {
-                    objects: protocol::fetch_many(&remote, auth, refs, haves).await?,
-                    shallow: HashSet::new(),
-                })
-            }
-        }
+        Endpoint::Ssh(remote) => protocol::fetch_options(&remote, auth, refs, haves, options).await,
         Endpoint::Http(base) => {
             let client = client()?;
             let ad = http_ad(&client, &base).await?;
             for (name, id) in refs {
                 ensure!(
-                    ad.refs.get(name) == Some(id),
+                    options.raw || ad.refs.get(name) == Some(id),
                     "remote ref changed while fetching; retry"
                 );
             }
             let tips: HashSet<_> = refs.values().copied().collect();
-            let request =
-                protocol::request_depth(&ad, &tips.into_iter().collect::<Vec<_>>(), haves, depth)?;
+            let request = protocol::request_options(
+                &ad,
+                &tips.into_iter().collect::<Vec<_>>(),
+                haves,
+                options,
+            )?;
             let response = http_auth(client.post(service_url(&base, "git-upload-pack")?), &base)?
                 .header(
                     reqwest::header::CONTENT_TYPE,
@@ -271,10 +306,10 @@ pub async fn fetch_depth(
                 .await?;
             let data = body(response, "application/x-git-upload-pack-result", MAX_PACK).await?;
             let mut bytes = data.as_slice();
-            let mut shallow = HashSet::new();
-            if depth.is_some() {
+            let mut shallow = options.shallow.clone();
+            if options.changes_depth() {
                 while let Some(line) = packet(&mut bytes)? {
-                    protocol::shallow_line(line, &mut shallow)?;
+                    protocol::boundary_line(line, &mut shallow, &options.shallow)?;
                 }
             }
             protocol::check_ack(
@@ -291,17 +326,17 @@ pub async fn fetch_depth(
             let (mut socket, ad) = native_ad(&base).await?;
             for (name, id) in refs {
                 ensure!(
-                    ad.refs.get(name) == Some(id),
+                    options.raw || ad.refs.get(name) == Some(id),
                     "remote ref changed while fetching; retry"
                 );
             }
             let tips: HashSet<_> = refs.values().copied().collect();
             socket
-                .write_all(&protocol::request_depth(
+                .write_all(&protocol::request_options(
                     &ad,
                     &tips.into_iter().collect::<Vec<_>>(),
                     haves,
-                    depth,
+                    options,
                 )?)
                 .await?;
             socket.shutdown().await?;
@@ -312,10 +347,10 @@ pub async fn fetch_depth(
                 .await?;
             ensure!(data.len() <= MAX_PACK, "native Git response exceeds limit");
             let mut bytes = data.as_slice();
-            let mut shallow = HashSet::new();
-            if depth.is_some() {
+            let mut shallow = options.shallow.clone();
+            if options.changes_depth() {
                 while let Some(line) = packet(&mut bytes)? {
-                    protocol::shallow_line(line, &mut shallow)?;
+                    protocol::boundary_line(line, &mut shallow, &options.shallow)?;
                 }
             }
             protocol::check_ack(
@@ -331,16 +366,17 @@ pub async fn fetch_depth(
             let repo = Repo::open(&path)?;
             let ad = local_ad(&repo)?;
             let mut store = Store::new(&repo);
+            store.allow_promisor = false;
             let mut objects = Objects::new();
             let mut total = 0;
             for (name, id) in refs {
                 ensure!(
-                    ad.refs.get(name) == Some(id),
+                    options.raw || ad.refs.get(name) == Some(id),
                     "local source ref changed while fetching; retry"
                 );
             }
             let mut shallow = store.shallow.clone();
-            if let Some(depth) = depth {
+            if let Some(depth) = options.depth {
                 let tips: Vec<_> = refs
                     .values()
                     .map(|id| crate::revision::peel(&mut store, *id))
@@ -356,6 +392,15 @@ pub async fn fetch_depth(
                 shallow.extend(crate::shallow::boundary(&mut store, &commits, depth)?);
                 store.shallow = shallow.clone();
             }
+            if let Some(deepen) = options.deepen {
+                let tips: Vec<_> = options.shallow.iter().copied().collect();
+                shallow.extend(crate::shallow::boundary(
+                    &mut store,
+                    &tips,
+                    deepen.checked_add(1).context("depth overflow")?,
+                )?);
+                store.shallow = shallow.clone();
+            }
             let ids = crate::object::reachable_many_since(
                 &mut store,
                 &refs.values().copied().collect::<Vec<_>>(),
@@ -368,6 +413,15 @@ pub async fn fetch_depth(
                     total <= MAX_TOTAL && objects.len() < MAX_OBJECTS,
                     "local transfer budget exceeded"
                 );
+                if options
+                    .filter
+                    .as_deref()
+                    .map(|f| crate::partial::omitted(f, &obj))
+                    .transpose()?
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 objects.insert(id, obj);
             }
             Ok(Fetched { objects, shallow })
@@ -426,7 +480,7 @@ pub enum Push {
         base: url::Url,
         name: String,
         old: Option<Oid>,
-        delete_refs: bool,
+        advertisement: Advertisement,
     },
 }
 fn http_auth(request: reqwest::RequestBuilder, base: &url::Url) -> Result<reqwest::RequestBuilder> {
@@ -480,7 +534,7 @@ impl Push {
                     base,
                     name: name.into(),
                     old: ad.refs.get(name).copied(),
-                    delete_refs: ad.caps.contains("delete-refs"),
+                    advertisement: ad,
                 })
             }
             _ => anyhow::bail!("push requires SSH or HTTP(S)"),
@@ -498,25 +552,40 @@ impl Push {
             Self::Http { .. } => Ok(()),
         }
     }
+    pub fn advertisement(&self) -> &Advertisement {
+        match self {
+            Self::Ssh(p) => &p.advertisement,
+            Self::Http { advertisement, .. } => advertisement,
+        }
+    }
     pub async fn send(self, new: Oid, pack: Vec<u8>) -> Result<()> {
         match self {
             Self::Ssh(p) => p.send(new, pack).await,
+            Self::Http { ref name, old, .. } => {
+                let updates = vec![protocol::RefUpdate {
+                    name: name.clone(),
+                    old,
+                    new,
+                }];
+                self.send_many(&updates, false, pack).await
+            }
+        }
+    }
+    pub async fn send_many(
+        self,
+        updates: &[protocol::RefUpdate],
+        atomic: bool,
+        pack: Vec<u8>,
+    ) -> Result<()> {
+        match self {
+            Self::Ssh(p) => p.send_many(updates, atomic, pack).await,
             Self::Http {
                 client,
                 base,
-                name,
-                old,
-                delete_refs,
+                advertisement,
+                ..
             } => {
-                ensure!(
-                    new != Oid::ZERO || delete_refs,
-                    "server does not allow deletion"
-                );
-                let mut request = crate::transport::packet(
-                    format!("{} {new} {name}\0report-status\n", old.unwrap_or(Oid::ZERO))
-                        .as_bytes(),
-                )?;
-                request.extend_from_slice(b"0000");
+                let mut request = protocol::push_request(&advertisement, updates, atomic)?;
                 request.extend(pack);
                 let response =
                     http_auth(client.post(service_url(&base, "git-receive-pack")?), &base)?
@@ -539,15 +608,14 @@ impl Push {
                 .await?;
                 let mut bytes = data.as_slice();
                 ensure!(
-                    packet(&mut bytes)? == Some(b"unpack ok\n".as_slice()),
+                    packet(&mut bytes)? == Some(b"unpack ok\n"),
                     "remote unpack failed"
                 );
-                let expected = format!("ok {name}\n");
-                ensure!(
-                    packet(&mut bytes)? == Some(expected.as_bytes()),
-                    "remote rejected push"
-                );
-                ensure!(packet(&mut bytes)?.is_none(), "unexpected extra ref status");
+                let mut remaining: HashSet<_> = updates.iter().map(|u| u.name.as_str()).collect();
+                while let Some(line) = packet(&mut bytes)? {
+                    protocol::push_status(line, &mut remaining)?;
+                }
+                ensure!(remaining.is_empty(), "missing ref status");
                 Ok(())
             }
         }

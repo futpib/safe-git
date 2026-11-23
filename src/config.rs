@@ -260,6 +260,7 @@ pub fn set(repo: &Repo, key: &str, new: &str, directory: &std::path::Path) -> Re
             .to_owned();
         crate::repo::tracking(remote, &branch)?;
         let mut binding = trust::named(repo, remote)?.unwrap_or(Binding {
+            filter: None,
             url: String::new(),
             remote: remote.into(),
             branch,

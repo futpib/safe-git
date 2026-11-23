@@ -224,7 +224,8 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             "grep",
             "apply",
             "am",
-            "format-patch"
+            "format-patch",
+            "sparse-checkout"
         ]
         .contains(&name),
         "unsupported Git command {name}; no external fallback is implemented"
@@ -258,6 +259,7 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
     );
     let mut store = Store::new(&repo);
     match name {
+        "sparse-checkout" => crate::sparse::run(cli, &repo, &mut store, items),
         "grep" => crate::search::grep(cli, &repo, &mut store, items),
         "apply" | "am" | "format-patch" => crate::mail::run(cli, &repo, &mut store, name, items),
         "show" | "blame" => crate::inspect::run(cli, &repo, &mut store, name, items),
@@ -448,7 +450,18 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                 Ok(())
             }
         }
+        "reset" if items.iter().any(|a| a == "--") => {
+            crate::workflow::legacy_restore(cli, &repo, &mut store, items, true)
+        }
         "reset" => crate::history::reset(&repo, &mut store, items, cli.quiet),
+        "checkout"
+            if items
+                .iter()
+                .position(|a| a == "--")
+                .is_some_and(|i| i + 1 < items.len()) =>
+        {
+            crate::workflow::legacy_restore(cli, &repo, &mut store, items, false)
+        }
         "checkout" => {
             let mut filtered = Vec::new();
             let mut branch = None;
@@ -494,9 +507,25 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             let mut no_edit = false;
             let mut all = false;
             let mut quiet = cli.quiet;
+            let mut allow_empty = false;
+            let mut author = None;
+            let mut names = Vec::new();
+            let mut end = false;
             let mut i = 0;
             while i < items.len() {
+                if end {
+                    names.push(items[i].clone());
+                    i += 1;
+                    continue;
+                }
                 match items[i].as_str() {
+                    "--" => end = true,
+                    "--allow-empty" => allow_empty = true,
+                    "--author" => {
+                        i += 1;
+                        author = Some(items.get(i).context("missing author")?.clone());
+                    }
+                    a if a.starts_with("--author=") => author = Some(a[9..].into()),
                     "-am" | "-m" | "--message" => {
                         all |= items[i] == "-am";
                         i += 1;
@@ -521,7 +550,10 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                     "--no-edit" => no_edit = true,
                     "-a" | "--all" => all = true,
                     "-q" | "--quiet" => quiet = true,
-                    other => anyhow::bail!("unsupported commit option {other}"),
+                    other if other.starts_with('-') => {
+                        anyhow::bail!("unsupported commit option {other}")
+                    }
+                    _ => names.push(items[i].clone()),
                 }
                 i += 1;
             }
@@ -537,6 +569,10 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             if amend {
                 crate::sequence::amend_allowed(&repo)?;
             }
+            ensure!(
+                !repo.exists("safe-git-sequence")? || (names.is_empty() && author.is_none()),
+                "path/author overrides cannot change an in-progress sequence; finish it first"
+            );
             if !amend
                 && let Some(message) = message.as_deref()
                 && crate::sequence::commit_pending(cli, &repo, &mut store, message)?
@@ -562,7 +598,18 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                 message.as_deref().or(previous_message.as_deref()).context(
                     "commit requires -m or --amend --no-edit; editors are not implemented",
                 )?,
-                porcelain::CommitOptions { all, quiet, amend },
+                porcelain::CommitOptions {
+                    all,
+                    quiet,
+                    amend,
+                    allow_empty,
+                    author,
+                    paths: if names.is_empty() {
+                        None
+                    } else {
+                        Some(crate::workflow::paths(&names, &cli.prefix)?)
+                    },
+                },
             )
         }
         "diff" => diff(&repo, &mut store, items),
@@ -693,13 +740,24 @@ pub async fn fetch_binding(
     if !store.shallow.is_empty() {
         haves.clear();
     }
-    let boundary = crate::object::commits(store, &haves)?;
-    store.add(network::fetch(&binding.url, &cli.auth()?, &selected, &haves).await?)?;
-    let ids = crate::object::reachable_many_since(
+    let options = crate::fetch_options(cli, store, binding.filter.clone());
+    let boundary = crate::partial::boundary(store, &haves, &options)?;
+    let fetched =
+        network::fetch_options(&binding.url, &cli.auth()?, &selected, &haves, &options).await?;
+    if binding.filter.is_some() {
+        crate::partial::store_pack(repo, &fetched.objects)?;
+    }
+    store.shallow = fetched.shallow;
+    store.add(fetched.objects)?;
+    let seen = crate::partial::persist(
+        repo,
         store,
         &selected.values().copied().collect::<Vec<_>>(),
+        binding.filter.is_some(),
         &boundary,
     )?;
+    crate::shallow::validate(store, &seen, &options.shallow)?;
+    crate::shallow::save(repo, &store.shallow)?;
     let mut updates = BTreeMap::new();
     for (name, id) in &selected {
         if name.starts_with("refs/heads/") {
@@ -716,9 +774,6 @@ pub async fn fetch_binding(
             "fetch would clobber existing tag {dest}"
         );
         updates.insert(dest, (old, *id));
-    }
-    for id in ids {
-        repo.write_object(store.get(id)?.as_ref())?;
     }
     for (dest, (old, id)) in &updates {
         repo.update_ref(dest, *old, *id)?;
@@ -793,10 +848,22 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
     let staged = porcelain::index(repo)?;
     let (mut before, mut after) = if pos.is_empty() {
         if flag(items, "--cached") || flag(items, "--staged") {
-            (crate::index::tree(store, repo.read_ref("HEAD")?)?, staged)
+            (
+                crate::index::tree(store, repo.read_ref("HEAD")?)?,
+                staged
+                    .into_iter()
+                    .filter(|(_, e)| e.flags & crate::index::INTENT == 0)
+                    .collect(),
+            )
         } else {
             let actual = crate::checkout::snapshot(repo, &staged)?;
-            (staged, actual)
+            (
+                staged
+                    .into_iter()
+                    .filter(|(_, e)| e.flags & crate::index::INTENT == 0)
+                    .collect(),
+                actual,
+            )
         }
     } else if pos.len() == 1 && pos[0].contains("..") {
         let (a, b) = pos[0].split_once("..").unwrap();
@@ -824,6 +891,8 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
             },
         )
     };
+    before.retain(|_, e| e.flags & crate::index::INTENT == 0);
+    after.retain(|_, e| e.flags & crate::index::INTENT == 0);
     if separator < items.len() {
         let paths = &items[separator + 1..];
         let keep = |path: &Vec<u8>, _: &mut crate::index::Entry| {

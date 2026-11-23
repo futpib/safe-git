@@ -156,6 +156,7 @@ pub async fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String])
         after_index.insert(
             spec.clone(),
             Entry {
+                flags: 0,
                 mode: 0o160000,
                 oid: id,
             },
@@ -193,6 +194,7 @@ pub async fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String])
         };
         repo.write_object(&obj)?;
         let entry = Entry {
+            flags: 0,
             mode: 0o100644,
             oid: obj.oid()?,
         };
@@ -202,6 +204,7 @@ pub async fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String])
         after.insert(
             spec,
             Entry {
+                flags: 0,
                 mode: 0o160000,
                 oid: id,
             },
@@ -367,6 +370,8 @@ async fn clone_at(cli: &Cli, repo: &Repo, path: &[u8], url: &str) -> Result<Oid>
         url,
         &cli.auth()?,
         crate::clone::Options {
+            filter: None,
+            no_checkout: false,
             depth: None,
             branch: None,
             remote: "origin",

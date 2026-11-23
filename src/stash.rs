@@ -109,8 +109,20 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
     let mut patch = false;
     let mut restore_index = false;
     let mut quiet = cli.quiet;
+    let mut keep_index = None;
+    let mut staged_only = false;
+    let mut names = Vec::new();
+    let mut end = false;
     while let Some(arg) = items.next() {
+        if end {
+            names.push(arg.clone());
+            continue;
+        }
         match arg.as_str() {
+            "--" if command == "push" => end = true,
+            "-k" | "--keep-index" if command == "push" => keep_index = Some(true),
+            "--no-keep-index" if command == "push" => keep_index = Some(false),
+            "-S" | "--staged" if command == "push" => staged_only = true,
             "-m" | "--message" if command == "push" => {
                 message = Some(items.next().context("missing stash message")?.as_str())
             }
@@ -121,7 +133,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                 include_untracked = true;
                 include_ignored = true;
             }
-            "-p" | "--patch" if command == "show" => patch = true,
+            "-p" | "--patch" if matches!(command, "show" | "push") => patch = true,
             "--stat" if command == "show" => {}
             a if matches!(command, "pop" | "apply" | "drop" | "show") => {
                 selection = a
@@ -131,25 +143,40 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                     .parse()
                     .context("invalid stash selector")?;
             }
+            a if command == "push" && !a.starts_with('-') => names.push(arg.clone()),
             _ => bail!("unsupported stash option {arg}"),
         }
     }
     match command {
         "push" => {
+            let keep_index = keep_index.unwrap_or(patch);
+            staged_only &= !patch;
+            ensure!(
+                !(patch || staged_only) || !include_untracked,
+                "patch/staged stash cannot include untracked files"
+            );
+            let specs = if names.is_empty() {
+                vec![Vec::new()]
+            } else {
+                crate::workflow::paths(&names, &cli.prefix)?
+            };
             let head_name = repo.head()?;
             let head = repo
                 .read_ref(&head_name)?
                 .context("cannot stash before the first commit")?;
             let staged = porcelain::index(repo)?;
             let working = checkout::snapshot(repo, &staged)?;
+            ensure!(
+                !staged.values().any(|e| e.flags & crate::index::INTENT != 0),
+                "stage intent-to-add entries before stashing"
+            );
             let mut extra = crate::index::Entries::new();
             if include_untracked {
-                for path in
-                    crate::workflow::untracked(repo, &staged, &[Vec::new()], include_ignored)?
-                {
+                for path in crate::workflow::untracked(repo, &staged, &specs, include_ignored)? {
                     extra.insert(
                         path,
                         crate::index::Entry {
+                            flags: 0,
                             mode: 0o100644,
                             oid: Oid::ZERO,
                         },
@@ -158,11 +185,62 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                 extra = checkout::snapshot(repo, &extra)?;
             }
             let base = porcelain::tree(store, head)?;
-            if staged == base && working == base && extra.is_empty() {
+            let selected = |p: &[u8]| crate::workflow::selected(p, &specs);
+            let mut candidates = base.clone();
+            candidates.extend(staged.clone());
+            candidates.extend(extra.clone());
+            crate::workflow::check_paths(&specs, &candidates.keys().cloned().collect())?;
+            let mut saved_work = base.clone();
+            saved_work.retain(|p, _| !selected(p));
+            saved_work.extend(
+                if staged_only { &staged } else { &working }
+                    .iter()
+                    .filter(|(p, _)| selected(p))
+                    .map(|(p, e)| (p.clone(), *e)),
+            );
+            if patch {
+                saved_work = crate::patch::select(repo, store, &base, &saved_work)?;
+            }
+            if saved_work == base && extra.is_empty() {
                 if !quiet {
                     println!("No local changes to save");
                 }
                 return Ok(());
+            }
+            // Compute all removals before publishing the stash. Overlapping unstaged
+            // changes must fail without modifying the worktree or losing the index.
+            let mut after = if patch || staged_only {
+                porcelain::three_way(repo, store, &saved_work, &working, &base)?
+            } else {
+                let mut after = working.clone();
+                after.retain(|p, _| !selected(p));
+                after.extend(
+                    base.iter()
+                        .filter(|(p, _)| selected(p))
+                        .map(|(p, e)| (p.clone(), *e)),
+                );
+                after
+            };
+            let mut index_after = staged.clone();
+            if keep_index {
+                let mut selected_index = base.clone();
+                selected_index.retain(|p, _| !selected(p));
+                selected_index.extend(
+                    staged
+                        .iter()
+                        .filter(|(p, _)| selected(p))
+                        .map(|(p, e)| (p.clone(), *e)),
+                );
+                if !patch {
+                    after = porcelain::three_way(repo, store, &base, &after, &selected_index)?;
+                }
+            } else {
+                index_after.retain(|p, _| !selected(p));
+                index_after.extend(
+                    base.iter()
+                        .filter(|(p, _)| selected(p))
+                        .map(|(p, e)| (p.clone(), *e)),
+                );
             }
             // Validate before creating the record; hooks and signing are never consulted.
             let identity = porcelain::identity(repo, &cli.config, "COMMITTER")?;
@@ -188,7 +266,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                 &identity,
                 format!("index on {label}: {base_subject}").as_bytes(),
             )?;
-            let work_tree = porcelain::write_tree(repo, &working)?;
+            let work_tree = porcelain::write_tree(repo, &saved_work)?;
             let mut parents = vec![head, index_commit];
             if include_untracked {
                 let tree = porcelain::write_tree(repo, &extra)?;
@@ -222,9 +300,9 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                     head: head_name,
                     tip: head,
                     before: working,
-                    after: base.clone(),
+                    after,
                     index_before: staged,
-                    index_after: base,
+                    index_after,
                 },
             )?;
             if !quiet {

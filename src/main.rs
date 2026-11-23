@@ -17,6 +17,7 @@ mod object;
 mod output;
 mod pack;
 mod packed;
+mod partial;
 mod patch;
 mod porcelain;
 mod protocol;
@@ -28,6 +29,7 @@ mod revision;
 mod search;
 mod sequence;
 mod shallow;
+mod sparse;
 mod stash;
 mod submodule;
 mod tags;
@@ -37,7 +39,7 @@ mod workflow;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use object::{Oid, ReadObjects, ancestor, commits, reachable, reachable_since};
+use object::{Oid, ReadObjects, ancestor, reachable};
 use repo::{Repo, Store};
 use std::{path::PathBuf, time::Duration};
 use transport::Auth;
@@ -87,6 +89,11 @@ struct Cli {
 enum Command {
     /// Clone verified objects into a new or empty repository
     Clone {
+        /// Omit historical blobs; missing content uses the host-registered endpoint
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(short = 'n', long)]
+        no_checkout: bool,
         #[arg(long,value_parser=clap::value_parser!(u32).range(1..))]
         depth: Option<u32>,
         /// Select a branch instead of the remote's advertised default
@@ -120,6 +127,10 @@ enum Command {
     },
     /// Fetch one branch from an explicit SSH URL into a tracking ref
     Fetch {
+        #[arg(long, value_parser=clap::value_parser!(u32).range(1..), conflicts_with_all=["unshallow", "depth"])]
+        deepen: Option<u32>,
+        #[arg(long, value_parser=clap::value_parser!(u32).range(1..), conflicts_with="unshallow")]
+        depth: Option<u32>,
         #[arg(long)]
         unshallow: bool,
         url: Option<String>,
@@ -171,6 +182,12 @@ enum Command {
     },
     /// Push branches or tags to a caller-selected or host-registered endpoint
     Push {
+        /// Push every local branch
+        #[arg(long, conflicts_with_all = ["tags", "delete"])]
+        all: bool,
+        /// Require the server to update every requested ref or none
+        #[arg(long)]
+        atomic: bool,
         /// Validate the push without updating refs or upstreams
         #[arg(short = 'n', long)]
         dry_run: bool,
@@ -216,6 +233,8 @@ async fn run(cli: &Cli) -> Result<()> {
         return compat::run(cli, args).await;
     }
     if let Command::Clone {
+        filter,
+        no_checkout,
         depth,
         url,
         path,
@@ -245,6 +264,8 @@ async fn run(cli: &Cli) -> Result<()> {
             &network::normalize_from(url, &cli.repository)?,
             &cli.auth()?,
             clone::Options {
+                filter: filter.as_deref(),
+                no_checkout: *no_checkout,
                 depth: *depth,
                 branch: branch.as_deref(),
                 remote: origin,
@@ -441,6 +462,8 @@ async fn run(cli: &Cli) -> Result<()> {
             }
         }
         Command::Push {
+            all,
+            atomic,
             dry_run,
             url,
             refspec,
@@ -455,6 +478,8 @@ async fn run(cli: &Cli) -> Result<()> {
                 &repo,
                 &mut store,
                 push::Options {
+                    all: *all,
+                    atomic: *atomic,
                     dry_run: *dry_run,
                     url: url.as_deref(),
                     specs: refspec,
@@ -469,6 +494,20 @@ async fn run(cli: &Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn fetch_options(cli: &Cli, store: &Store<'_>, filter: Option<String>) -> network::FetchOptions {
+    let (depth, deepen) = match &cli.command {
+        Command::Fetch { depth, deepen, .. } => (*depth, *deepen),
+        _ => (None, None),
+    };
+    network::FetchOptions {
+        depth,
+        deepen,
+        shallow: store.shallow.clone(),
+        filter,
+        raw: false,
+    }
 }
 
 async fn fetch(
@@ -499,24 +538,31 @@ async fn fetch(
     if !store.shallow.is_empty() {
         haves.clear();
     }
-    let boundary = commits(store, &haves)?;
     let endpoint = trust::endpoint(repo, url, cli.remote_url.as_deref())?;
     let endpoint = network::normalize_from(&endpoint, &cli.repository)?;
     let ad = network::discover(&endpoint, &cli.auth()?).await?;
     let tip = ad.branch(&branch).context("remote branch does not exist")?;
-    let objects = network::fetch(
+    let binding = trust::selected(repo, url)?;
+    let filter = binding.filter(|b| b.url == endpoint).and_then(|b| b.filter);
+    let options = fetch_options(cli, store, filter.clone());
+    let boundary = partial::boundary(store, &haves, &options)?;
+    let fetched = network::fetch_options(
         &endpoint,
         &cli.auth()?,
         &std::collections::HashMap::from([(format!("refs/heads/{branch}"), tip)]),
         &haves,
+        &options,
     )
     .await?;
-    store.add(objects)?;
-    store.get(tip)?.commit()?;
-    let ids = reachable_since(store, tip, &boundary)?;
-    for id in ids {
-        repo.write_object(store.get(id)?.as_ref())?;
+    if filter.is_some() {
+        partial::store_pack(repo, &fetched.objects)?;
     }
+    store.shallow = fetched.shallow;
+    store.add(fetched.objects)?;
+    store.get(tip)?.commit()?;
+    let seen = partial::persist(repo, store, &[tip], filter.is_some(), &boundary)?;
+    shallow::validate(store, &seen, &options.shallow)?;
+    shallow::save(repo, &store.shallow)?;
     let fast_forward = match old {
         Some(old) if old != tip => ancestor(store, old, tip)?,
         _ => true,
@@ -607,6 +653,7 @@ fn merge(
 #[tokio::main]
 async fn main() {
     let mut cli = Cli::parse();
+    partial::configure(&cli);
     let location = locate(&mut cli);
     let result = if let Err(e) = location {
         Err(e)

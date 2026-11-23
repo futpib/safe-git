@@ -139,6 +139,7 @@ pub fn select(
         result.insert(
             path.clone(),
             Entry {
+                flags: 0,
                 mode: a.or(b).context("missing patch entry")?.mode,
                 oid,
             },

@@ -9,6 +9,8 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeSet, HashMap};
 pub struct Options<'a> {
+    pub all: bool,
+    pub atomic: bool,
     pub dry_run: bool,
     pub url: Option<&'a str>,
     pub specs: &'a [String],
@@ -45,6 +47,17 @@ pub async fn run(
     let head = repo.head()?;
     let default = head.strip_prefix("refs/heads/");
     let mut specs = options.specs.to_vec();
+    if options.all {
+        ensure!(specs.is_empty(), "--all takes no refspecs");
+        specs.extend(
+            repo.refs()?
+                .into_keys()
+                .filter(|r| r.starts_with("refs/heads/")),
+        );
+        if specs.is_empty() {
+            return Ok(());
+        }
+    }
     ensure!(
         !options.delete || !specs.is_empty(),
         "push --delete requires ref names"
@@ -124,8 +137,13 @@ pub async fn run(
         updates.push((source, dest, tip, force));
     }
     let auth = cli.auth()?;
+    let mut planned = Vec::new();
     for (source, dest, tip, force) in updates {
         let push = network::Push::prepare(&endpoint, &auth, &dest).await?;
+        ensure!(
+            !options.atomic || push.advertisement().caps.contains("atomic"),
+            "server does not support atomic push"
+        );
         let old = push.old();
         push.unchanged().await?;
         if let Some(lease) = options.lease {
@@ -179,6 +197,39 @@ pub async fn run(
                 "non-fast-forward push refused; destination is unchanged"
             );
         }
+        planned.push((source, dest, tip, old));
+    }
+    if options.atomic && !options.dry_run {
+        let updates: Vec<_> = planned
+            .iter()
+            .filter(|(_, _, tip, old)| *old != Some(*tip) && !(old.is_none() && *tip == Oid::ZERO))
+            .map(|(_, name, new, old)| crate::protocol::RefUpdate {
+                name: name.clone(),
+                old: *old,
+                new: *new,
+            })
+            .collect();
+        if !updates.is_empty() {
+            let mut ids = BTreeSet::new();
+            for update in &updates {
+                if update.new != Oid::ZERO {
+                    ids.extend(reachable(store, update.new)?);
+                }
+            }
+            let objects = ids
+                .into_iter()
+                .map(|id| store.get(id))
+                .collect::<Result<Vec<_>>>()?;
+            let pack = if updates.iter().all(|u| u.new == Oid::ZERO) {
+                Vec::new()
+            } else {
+                pack::encode(&objects)?
+            };
+            let push = network::Push::prepare(&endpoint, &auth, &updates[0].name).await?;
+            push.send_many(&updates, true, pack).await?;
+        }
+    }
+    for (source, dest, tip, old) in planned {
         if options.dry_run {
             if !cli.quiet {
                 eprintln!(
@@ -190,7 +241,7 @@ pub async fn run(
             }
             continue;
         }
-        if old != Some(tip) && !(old.is_none() && tip == Oid::ZERO) {
+        if !options.atomic && old != Some(tip) && !(old.is_none() && tip == Oid::ZERO) {
             let objects = if tip == Oid::ZERO {
                 Vec::new()
             } else {
@@ -213,6 +264,7 @@ pub async fn run(
         }
         if options.upstream {
             let b = binding.get_or_insert_with(|| trust::Binding {
+                filter: None,
                 url: endpoint.clone(),
                 remote: options
                     .url

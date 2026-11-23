@@ -228,10 +228,15 @@ pub fn decode(data: &[u8]) -> Result<Objects> {
 }
 
 pub fn encode(objects: &[Arc<Object>]) -> Result<Vec<u8>> {
+    Ok(encode_indexed(objects, false)?.0)
+}
+pub fn encode_indexed(objects: &[Arc<Object>], indexed: bool) -> Result<(Vec<u8>, Vec<u8>)> {
     ensure!(objects.len() <= MAX_OBJECTS, "too many objects to push");
     let mut pack = Vec::from(&b"PACK\0\0\0\x02"[..]);
     pack.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    let mut records = Vec::new();
     for obj in objects {
+        let offset = pack.len();
         let mut size = obj.data.len();
         let mut b = ((obj.kind as u8) << 4) | (size & 15) as u8;
         size >>= 4;
@@ -251,10 +256,45 @@ pub fn encode(objects: &[Arc<Object>]) -> Result<Vec<u8>> {
         z.write_all(&obj.data)?;
         pack.extend(z.finish()?);
         ensure!(pack.len() + 20 <= MAX_PACK, "outgoing pack exceeds limit");
+        if indexed {
+            let mut crc = flate2::Crc::new();
+            crc.update(&pack[offset..]);
+            records.push((obj.oid()?, crc.sum(), u32::try_from(offset)?));
+        }
     }
     let checksum = object::hash(&[&pack])?;
     pack.extend(checksum.0);
-    Ok(pack)
+    let mut index = Vec::new();
+    if indexed {
+        records.sort_by_key(|r| r.0);
+        ensure!(
+            records.windows(2).all(|w| w[0].0 != w[1].0),
+            "duplicate pack objects"
+        );
+        index.extend_from_slice(b"\xfftOc\0\0\0\x02");
+        let mut fanout = [0u32; 256];
+        for (id, _, _) in &records {
+            fanout[id.0[0] as usize] += 1;
+        }
+        let mut sum = 0u32;
+        for count in fanout {
+            sum += count;
+            index.extend_from_slice(&sum.to_be_bytes());
+        }
+        for (id, _, _) in &records {
+            index.extend_from_slice(&id.0);
+        }
+        for (_, crc, _) in &records {
+            index.extend_from_slice(&crc.to_be_bytes());
+        }
+        for (_, _, offset) in &records {
+            ensure!(*offset < 0x8000_0000, "pack offset exceeds limit");
+            index.extend_from_slice(&offset.to_be_bytes());
+        }
+        index.extend_from_slice(&checksum.0);
+        index.extend_from_slice(&object::hash(&[&index])?.0);
+    }
+    Ok((pack, index))
 }
 
 #[cfg(test)]

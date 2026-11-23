@@ -41,6 +41,7 @@ pub async fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String])
                 );
             }
             let mut binding = registry.remotes.remove(name).unwrap_or(trust::Binding {
+                filter: None,
                 remote: name.clone(),
                 url: String::new(),
                 branch: repo

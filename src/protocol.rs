@@ -136,18 +136,11 @@ pub async fn advertise(wire: &mut Wire) -> Result<Advertisement> {
     Ok(ad)
 }
 
-pub(crate) fn request(ad: &Advertisement, tips: &[Oid], haves: &[Oid]) -> Result<Vec<u8>> {
-    ensure!(
-        !tips.is_empty() && tips.len() <= 100_000,
-        "invalid want count"
-    );
-    request_depth(ad, tips, haves, None)
-}
-pub(crate) fn request_depth(
+pub(crate) fn request_options(
     ad: &Advertisement,
     tips: &[Oid],
     haves: &[Oid],
-    depth: Option<u32>,
+    options: &crate::network::FetchOptions,
 ) -> Result<Vec<u8>> {
     ensure!(
         !tips.is_empty() && tips.len() <= 100_000,
@@ -160,17 +153,38 @@ pub(crate) fn request_depth(
             caps.push_str(capability);
         }
     }
+    if options.filter.is_some() {
+        ensure!(
+            ad.caps.contains("filter"),
+            "server does not support partial clone filters"
+        );
+        caps.push_str(" filter");
+    }
+    if options.deepen.is_some() {
+        ensure!(
+            ad.caps.contains("deepen-relative"),
+            "server does not support relative deepening"
+        );
+        caps.push_str(" deepen-relative");
+    }
     let mut request = Vec::new();
     for (i, tip) in tips.iter().enumerate() {
         let caps = if i == 0 { caps.as_str() } else { "" };
         request.extend(transport::packet(format!("want {tip}{caps}\n").as_bytes())?);
     }
-    if let Some(depth) = depth {
+    for id in &options.shallow {
+        request.extend(transport::packet(format!("shallow {id}\n").as_bytes())?);
+    }
+    if let Some(depth) = options.depth.or(options.deepen) {
         ensure!(
             depth > 0 && ad.caps.contains("shallow"),
             "server does not support shallow fetch"
         );
         request.extend(transport::packet(format!("deepen {depth}\n").as_bytes())?);
+    }
+    if let Some(filter) = &options.filter {
+        crate::partial::filter(filter)?;
+        request.extend(transport::packet(format!("filter {filter}\n").as_bytes())?);
     }
     request.extend_from_slice(b"0000");
     ensure!(haves.len() <= 32, "too many negotiation tips");
@@ -179,21 +193,6 @@ pub(crate) fn request_depth(
     }
     request.extend(transport::packet(b"done\n")?);
     Ok(request)
-}
-async fn transfer(
-    mut wire: Wire,
-    ad: &Advertisement,
-    tips: &[Oid],
-    haves: &[Oid],
-) -> Result<Objects> {
-    wire.send(request(ad, tips, haves)?).await?;
-    wire.eof().await?;
-    let response = wire
-        .packet()
-        .await?
-        .context("missing negotiation response")?;
-    check_ack(&response, haves)?;
-    decode_pack(&wire.remainder().await?, haves)
 }
 pub(crate) fn check_ack(response: &[u8], haves: &[Oid]) -> Result<()> {
     if response != b"NAK\n" {
@@ -208,24 +207,6 @@ pub(crate) fn check_ack(response: &[u8], haves: &[Oid]) -> Result<()> {
     }
     Ok(())
 }
-pub async fn fetch_many(
-    remote: &Remote,
-    auth: &Auth,
-    refs: &HashMap<String, Oid>,
-    haves: &[Oid],
-) -> Result<Objects> {
-    let mut wire = Wire::connect(remote, auth, false).await?;
-    let ad = advertise(&mut wire).await?;
-    for (name, id) in refs {
-        ensure!(
-            ad.refs.get(name) == Some(id),
-            "remote ref changed while fetching; retry"
-        );
-    }
-    let tips: HashSet<_> = refs.values().copied().collect();
-    transfer(wire, &ad, &tips.into_iter().collect::<Vec<_>>(), haves).await
-}
-
 pub(crate) fn decode_pack(bytes: &[u8], haves: &[Oid]) -> Result<Objects> {
     // Git can acknowledge another offered commit after initially acknowledging
     // the wanted tip, even without multi_ack. Only accept our exact offered IDs.
@@ -272,11 +253,73 @@ pub async fn discover(remote: &Remote, auth: &Auth) -> Result<Advertisement> {
     Ok(ad)
 }
 
+pub struct RefUpdate {
+    pub name: String,
+    pub old: Option<Oid>,
+    pub new: Oid,
+}
+pub(crate) fn push_request(
+    ad: &Advertisement,
+    updates: &[RefUpdate],
+    atomic: bool,
+) -> Result<Vec<u8>> {
+    ensure!(
+        !updates.is_empty() && updates.len() <= 100_000,
+        "invalid push update count"
+    );
+    ensure!(
+        !atomic || ad.caps.contains("atomic"),
+        "server does not support atomic push"
+    );
+    let mut request = Vec::new();
+    let mut names = HashSet::new();
+    for (i, update) in updates.iter().enumerate() {
+        repo::refname(&update.name)?;
+        ensure!(names.insert(&update.name), "duplicate push destination");
+        ensure!(
+            ad.refs.get(&update.name).copied() == update.old,
+            "push rejected: destination changed while preparing transfer; retry"
+        );
+        ensure!(
+            update.new != Oid::ZERO || ad.caps.contains("delete-refs"),
+            "server does not allow deletion"
+        );
+        let caps = if i == 0 {
+            if atomic {
+                "\0report-status atomic"
+            } else {
+                "\0report-status"
+            }
+        } else {
+            ""
+        };
+        request.extend(transport::packet(
+            format!(
+                "{} {} {}{caps}\n",
+                update.old.unwrap_or(Oid::ZERO),
+                update.new,
+                update.name
+            )
+            .as_bytes(),
+        )?);
+    }
+    request.extend_from_slice(b"0000");
+    Ok(request)
+}
+pub(crate) fn push_status(line: &[u8], remaining: &mut HashSet<&str>) -> Result<()> {
+    let name = std::str::from_utf8(line)?
+        .strip_prefix("ok ")
+        .and_then(|v| v.strip_suffix('\n'))
+        .with_context(|| format!("remote rejected push: {}", String::from_utf8_lossy(line)))?;
+    ensure!(remaining.remove(name), "unexpected or duplicate ref status");
+    Ok(())
+}
+
 pub struct Push {
     wire: Wire,
     pub old: Option<Oid>,
     name: String,
-    delete_refs: bool,
+    pub advertisement: Advertisement,
 }
 impl Push {
     pub async fn prepare(remote: &Remote, auth: &Auth, name: &str) -> Result<Self> {
@@ -290,7 +333,7 @@ impl Push {
         Ok(Self {
             old: ad.refs.get(name).copied(),
             name: name.to_owned(),
-            delete_refs: ad.caps.contains("delete-refs"),
+            advertisement: ad,
             wire,
         })
     }
@@ -303,59 +346,51 @@ impl Push {
         );
         Ok(())
     }
-    pub async fn send(mut self, new: Oid, pack: Vec<u8>) -> Result<()> {
-        ensure!(
-            new != Oid::ZERO || self.delete_refs,
-            "server does not allow deletion"
-        );
-        let name = self.name.clone();
-        let mut request = transport::packet(
-            format!(
-                "{} {new} {name}\0report-status\n",
-                self.old.unwrap_or(Oid::ZERO)
-            )
-            .as_bytes(),
-        )?;
-        request.extend_from_slice(b"0000");
-        self.wire.send(request).await?;
+    pub async fn send(self, new: Oid, pack: Vec<u8>) -> Result<()> {
+        let updates = vec![RefUpdate {
+            name: self.name.clone(),
+            old: self.old,
+            new,
+        }];
+        self.send_many(&updates, false, pack).await
+    }
+    pub async fn send_many(
+        mut self,
+        updates: &[RefUpdate],
+        atomic: bool,
+        pack: Vec<u8>,
+    ) -> Result<()> {
+        self.wire
+            .send(push_request(&self.advertisement, updates, atomic)?)
+            .await?;
         self.wire.send(pack).await?;
         self.wire.eof().await?;
-        let unpack = self.wire.packet().await?.context("missing unpack status")?;
         ensure!(
-            unpack == b"unpack ok\n",
-            "remote unpack failed: {:?}",
-            String::from_utf8_lossy(&unpack)
+            self.wire.packet().await?.as_deref() == Some(b"unpack ok\n"),
+            "remote unpack failed"
         );
-        let status = self.wire.packet().await?.context("missing ref status")?;
-        ensure!(
-            status == format!("ok {name}\n").as_bytes(),
-            "remote rejected push: {:?}",
-            String::from_utf8_lossy(&status)
-        );
-        ensure!(
-            self.wire.packet().await?.is_none(),
-            "unexpected extra ref status"
-        );
-        // The flush terminates report-status, as in Git's receive_status().
-        // Later server output cannot change the acknowledged result. Drain it
-        // under the transport bounds without displaying or interpreting it,
-        // and still require a successful SSH service exit.
+        let mut remaining: HashSet<_> = updates.iter().map(|u| u.name.as_str()).collect();
+        while let Some(line) = self.wire.packet().await? {
+            push_status(&line, &mut remaining)?;
+        }
+        ensure!(remaining.is_empty(), "missing ref status");
         self.wire.remainder().await?;
         Ok(())
     }
 }
 
-pub async fn fetch_depth(
+pub async fn fetch_options(
     remote: &Remote,
     auth: &Auth,
     refs: &HashMap<String, Oid>,
-    depth: u32,
+    haves: &[Oid],
+    options: &crate::network::FetchOptions,
 ) -> Result<crate::network::Fetched> {
     let mut wire = Wire::connect(remote, auth, false).await?;
     let ad = advertise(&mut wire).await?;
     for (name, id) in refs {
         ensure!(
-            ad.refs.get(name) == Some(id),
+            options.raw || ad.refs.get(name) == Some(id),
             "remote ref changed while fetching; retry"
         );
     }
@@ -365,24 +400,42 @@ pub async fn fetch_depth(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    wire.send(request_depth(&ad, &tips, &[], Some(depth))?)
+    wire.send(request_options(&ad, &tips, haves, options)?)
         .await?;
     wire.eof().await?;
-    let mut shallow = HashSet::new();
-    while let Some(line) = wire.packet().await? {
-        shallow_line(&line, &mut shallow)?;
+    let mut shallow = options.shallow.clone();
+    if options.changes_depth() {
+        while let Some(line) = wire.packet().await? {
+            boundary_line(&line, &mut shallow, &options.shallow)?;
+        }
     }
     check_ack(
         &wire
             .packet()
             .await?
             .context("missing negotiation response")?,
-        &[],
+        haves,
     )?;
     Ok(crate::network::Fetched {
-        objects: decode_pack(&wire.remainder().await?, &[])?,
+        objects: decode_pack(&wire.remainder().await?, haves)?,
         shallow,
     })
+}
+pub(crate) fn boundary_line(
+    line: &[u8],
+    shallow: &mut HashSet<Oid>,
+    offered: &HashSet<Oid>,
+) -> Result<()> {
+    if let Some(value) = line.strip_prefix(b"unshallow ") {
+        let id = Oid::parse(value.strip_suffix(b"\n").unwrap_or(value))?;
+        ensure!(
+            offered.contains(&id) && shallow.remove(&id),
+            "unoffered or duplicate unshallow response"
+        );
+        Ok(())
+    } else {
+        shallow_line(line, shallow)
+    }
 }
 pub(crate) fn shallow_line(line: &[u8], shallow: &mut HashSet<Oid>) -> Result<()> {
     let value = line
@@ -404,6 +457,30 @@ pub(crate) fn shallow_line(line: &[u8], shallow: &mut HashSet<Oid>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn atomic_requests_and_statuses_require_exact_refs() {
+        let mut ad = Advertisement::new();
+        let updates = vec![RefUpdate {
+            name: "refs/heads/main".into(),
+            old: None,
+            new: Oid([1; 20]),
+        }];
+        assert!(push_request(&ad, &updates, true).is_err());
+        ad.caps.extend(["atomic".into(), "report-status".into()]);
+        let request = push_request(&ad, &updates, true).unwrap();
+        assert!(
+            request
+                .windows(b"report-status atomic".len())
+                .any(|w| w == b"report-status atomic")
+        );
+        ad.refs.insert("refs/heads/main".into(), Oid([2; 20]));
+        assert!(push_request(&ad, &updates, true).is_err());
+        let mut remaining = HashSet::from(["refs/heads/main"]);
+        assert!(push_status(b"ok refs/heads/other\n", &mut remaining).is_err());
+        assert!(push_status(b"ng refs/heads/main rejected\n", &mut remaining).is_err());
+        push_status(b"ok refs/heads/main\n", &mut remaining).unwrap();
+        assert!(push_status(b"ok refs/heads/main\n", &mut remaining).is_err());
+    }
     #[test]
     fn shallow_boundaries_are_bounded_data_with_optional_newlines() {
         for suffix in ["", "\n"] {

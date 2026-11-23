@@ -367,8 +367,9 @@ pub fn reset(repo: &Repo, store: &mut Store<'_>, args: &[String], quiet: bool) -
     let logs = logs(repo, &head, old, id, &format!("reset: moving to {value}"))?;
     if mode == "--mixed" {
         let mut lock = Pending::new(repo.root.try_clone()?, "index.lock".into())?;
-        lock.file
-            .write_all(&index::encode(&porcelain::tree(store, id)?)?)?;
+        let mut entries = porcelain::tree(store, id)?;
+        crate::sparse::mark(repo, &mut entries)?;
+        lock.file.write_all(&index::encode(&entries)?)?;
         lock.commit("index")?;
     }
     if let Some(old) = old {

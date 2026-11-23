@@ -87,6 +87,33 @@ pub fn ignored(rules: &[Rule], path: &[u8], directory: bool, budget: &mut usize)
     }
     Ok(ignored)
 }
+/// Sparse patterns include files, and a directory match applies to descendants.
+pub fn included(rules: &[Rule], path: &[u8], budget: &mut usize) -> Result<bool> {
+    let mut included = false;
+    for rule in rules {
+        for end in path
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| (*b == b'/').then_some(i))
+            .chain(std::iter::once(path.len()))
+        {
+            let directory = end < path.len();
+            if rule.directory && !directory {
+                continue;
+            }
+            let value = if rule.anchored {
+                &path[..end]
+            } else {
+                path[..end].rsplit(|b| *b == b'/').next().unwrap()
+            };
+            if matches(&rule.pattern, value, budget)? {
+                included = !rule.negative;
+                break;
+            }
+        }
+    }
+    Ok(included)
+}
 fn matches(pattern: &[u8], value: &[u8], budget: &mut usize) -> Result<bool> {
     let cost = (pattern.len() + 1).saturating_mul(value.len() + 1);
     ensure!(cost <= *budget, "ignore matching budget exceeded");

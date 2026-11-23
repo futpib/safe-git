@@ -599,6 +599,7 @@ fn loose(bytes: &[u8]) -> Result<Object> {
 }
 
 pub struct Store<'a> {
+    pub allow_promisor: bool,
     pub repo: &'a Repo,
     objects: Objects,
     bytes: usize,
@@ -614,7 +615,7 @@ impl std::fmt::Display for MissingObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "missing object {}; automatic promisor fetching is not implemented",
+            "missing object {}; no authorized promisor supplied it",
             self.0
         )
     }
@@ -623,6 +624,7 @@ impl std::error::Error for MissingObject {}
 impl<'a> Store<'a> {
     pub fn new(repo: &'a Repo) -> Self {
         Self {
+            allow_promisor: true,
             repo,
             objects: Objects::new(),
             bytes: 0,
@@ -806,7 +808,19 @@ impl ReadObjects for Store<'_> {
         })
     }
     fn get(&mut self, oid: Oid) -> Result<Arc<Object>> {
-        self.get_inner(oid, 0, &mut 0)
+        match self.get_inner(oid, 0, &mut 0) {
+            Err(error)
+                if error.downcast_ref::<MissingObject>().is_some() && self.allow_promisor =>
+            {
+                if let Some(objects) = crate::partial::hydrate(self.repo, oid)? {
+                    self.add(objects)?;
+                    self.get_inner(oid, 0, &mut 0)
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
     }
 }
 

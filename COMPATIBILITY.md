@@ -6,6 +6,9 @@ and stash. Directory moves preserve untracked files and unstaged edits; clean
 requires an explicit force request or dry run.
 Status accepts paths. Commits accept message files/stdin and --fixup; global
 config reads inert values and writes user.name/user.email without needing a repo.
+Staging supports `add -N`; commits accept paths, explicit `--author`, and
+`--allow-empty`. File restores also accept `reset -- PATH` and `checkout -- PATH`.
+Stash supports selected paths, `--patch`, `--staged`, and `--keep-index`.
 
 Inspection includes show, blame, path-filtered log, --all/--graph/--decorate,
 --author/--grep filters, tracked-file grep, diff --check/--name-status, three-dot
@@ -25,8 +28,14 @@ mail and supports --continue/--skip/--abort. Encoded MIME bodies/headers, copy
 patches, and gitlink patches are rejected. Patch paths use checkout's safeguards.
 
 Clone --depth negotiates shallow history; fetch --unshallow restores it.
+Fetch --depth/--deepen adjusts the boundary. Partial clones support
+`--filter=blob:none` and `blob:limit=N`, fetching missing blobs only from a
+host-registered promisor. Sparse checkout supports cone and non-cone patterns
+with ordinary indexes; compressed sparse indexes remain unsupported.
 Fetch supports SSH, HTTP(S), native git://, and local objects. Push supports
 SSH/HTTP(S), branches/tags, deletion, explicit force, and force-with-lease.
+Push --all selects every local branch; --atomic requires server support and
+updates all requested refs together or none.
 Push --dry-run checks the destination without sending updates or saving upstreams.
 Caller-provided SAFE_GIT_HTTP_TOKEN is sent only over HTTPS. Redirects and
 credential helpers are never followed.

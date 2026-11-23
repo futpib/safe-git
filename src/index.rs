@@ -3,11 +3,22 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Entry {
     pub mode: u32,
     pub oid: Oid,
+    #[serde(default)]
+    pub flags: u16,
 }
+pub const INTENT: u16 = 0x2000;
+pub const SKIP: u16 = 0x4000;
+// Flags describe the index, not the content of a tree or working file.
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode && self.oid == other.oid
+    }
+}
+impl Eq for Entry {}
 pub type Entries = BTreeMap<Vec<u8>, Entry>;
 pub type Conflicts = BTreeMap<Vec<u8>, [Option<Entry>; 3]>;
 
@@ -96,7 +107,16 @@ pub fn tree(store: &mut impl ReadObjects, commit: Option<Oid>) -> Result<Entries
                 self::mode(mode)?;
                 ensure!(entries.len() < MAX_OBJECTS, "too many tree entries");
                 ensure!(
-                    entries.insert(full, Entry { mode, oid: id }).is_none(),
+                    entries
+                        .insert(
+                            full,
+                            Entry {
+                                mode,
+                                oid: id,
+                                flags: 0
+                            }
+                        )
+                        .is_none(),
                     "duplicate tree path"
                 );
             }
@@ -154,9 +174,28 @@ pub fn decode_full(bytes: &[u8]) -> Result<(Entries, Conflicts)> {
         pos += 62;
         let stage = (flags >> 12) & 3;
         ensure!(
-            flags & 0xc000 == 0,
-            "assume-unchanged, sparse, and extended index entries are unsupported"
+            flags & 0x8000 == 0,
+            "assume-unchanged entries are unsupported"
         );
+        let extended = if flags & 0x4000 != 0 {
+            ensure!(
+                version >= 3 && pos + 2 <= end,
+                "invalid extended index entry"
+            );
+            let value = u16::from_be_bytes(bytes[pos..pos + 2].try_into()?);
+            pos += 2;
+            ensure!(
+                value & !(INTENT | SKIP) == 0 && stage == 0,
+                "unsupported extended index flags"
+            );
+            ensure!(
+                value != (INTENT | SKIP),
+                "incompatible extended index flags"
+            );
+            value
+        } else {
+            0
+        };
         let mut name = Vec::new();
         if version == 4 {
             ensure!(pos < end, "truncated index prefix");
@@ -204,10 +243,20 @@ pub fn decode_full(bytes: &[u8]) -> Result<(Entries, Conflicts)> {
         previous = name.clone();
         previous_stage = stage;
         if stage == 0 {
-            entries.insert(name, Entry { mode, oid });
+            entries.insert(
+                name,
+                Entry {
+                    mode,
+                    oid,
+                    flags: extended,
+                },
+            );
         } else {
-            conflicts.entry(name).or_insert([None; 3])[usize::from(stage) - 1] =
-                Some(Entry { mode, oid });
+            conflicts.entry(name).or_insert([None; 3])[usize::from(stage) - 1] = Some(Entry {
+                mode,
+                oid,
+                flags: 0,
+            });
         }
     }
     while pos < end {
@@ -245,6 +294,9 @@ pub fn encode_full(entries: &Entries, conflicts: &Conflicts) -> Result<Vec<u8>> 
     ensure!(entries.len() <= MAX_OBJECTS, "index entry limit exceeded");
     no_prefix_conflicts(entries)?;
     let mut out = b"DIRC\0\0\0\x02".to_vec();
+    if entries.values().any(|e| e.flags != 0) {
+        out[7] = 3;
+    }
     let mut records = BTreeMap::new();
     for (path, entry) in entries {
         records.insert((path, 0u16), entry);
@@ -271,7 +323,19 @@ pub fn encode_full(entries: &Entries, conflicts: &Conflicts) -> Result<Vec<u8>> 
         out.extend_from_slice(&entry.mode.to_be_bytes());
         out.extend_from_slice(&[0; 12]);
         out.extend_from_slice(&entry.oid.0);
-        out.extend_from_slice(&((name.len().min(0xfff) as u16) | (stage << 12)).to_be_bytes());
+        ensure!(
+            entry.flags & !(INTENT | SKIP) == 0
+                && entry.flags != (INTENT | SKIP)
+                && (stage == 0 || entry.flags == 0),
+            "invalid index flags"
+        );
+        let extended = if entry.flags != 0 { 0x4000 } else { 0 };
+        out.extend_from_slice(
+            &((name.len().min(0xfff) as u16) | (stage << 12) | extended).to_be_bytes(),
+        );
+        if extended != 0 {
+            out.extend_from_slice(&entry.flags.to_be_bytes());
+        }
         out.extend_from_slice(name);
         out.push(0);
         while !(out.len() - start).is_multiple_of(8) {
@@ -285,6 +349,30 @@ pub fn encode_full(entries: &Entries, conflicts: &Conflicts) -> Result<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn extended_flags_roundtrip_and_reserved_bits_fail_closed() {
+        for flags in [INTENT, SKIP] {
+            let entries = Entries::from([(
+                b"file".to_vec(),
+                Entry {
+                    mode: 0o100644,
+                    oid: Oid([1; 20]),
+                    flags,
+                },
+            )]);
+            let bytes = encode(&entries).unwrap();
+            let decoded = decode(&bytes).unwrap();
+            assert_eq!(decoded[b"file".as_slice()].flags, flags);
+            assert_eq!(encode(&decoded).unwrap(), bytes);
+            for extended in [0x8000u16, INTENT | SKIP, 1] {
+                let mut bad = bytes.clone();
+                bad[74..76].copy_from_slice(&extended.to_be_bytes());
+                bad.truncate(bad.len() - 20);
+                bad.extend_from_slice(&object::hash(&[&bad]).unwrap().0);
+                assert!(decode(&bad).is_err());
+            }
+        }
+    }
     #[test]
     fn malformed_v4_with_valid_checksum() {
         let mut bytes = b"DIRC\0\0\0\x04\0\0\0\x01".to_vec();
@@ -307,6 +395,7 @@ mod tests {
             Entry {
                 mode: 0o100644,
                 oid: Oid([1; 20]),
+                flags: 0,
             },
         );
         let bytes = encode(&entries).unwrap();

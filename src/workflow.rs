@@ -160,7 +160,7 @@ fn intersects(path: &[u8], specs: &[Vec<u8>]) -> bool {
                 .is_some_and(|v| v.starts_with(b"/"))
         })
 }
-fn check_paths(specs: &[Vec<u8>], candidates: &BTreeSet<Vec<u8>>) -> Result<()> {
+pub(crate) fn check_paths(specs: &[Vec<u8>], candidates: &BTreeSet<Vec<u8>>) -> Result<()> {
     for spec in specs {
         ensure!(
             spec.is_empty()
@@ -343,6 +343,7 @@ pub(crate) fn scan_untracked(
 }
 
 fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
+    let mut intent = false;
     let mut patch = false;
     let (mut all, mut update, mut force, mut end) = (false, false, false, false);
     let mut names = Vec::new();
@@ -354,6 +355,7 @@ fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
         match arg.as_str() {
             "--" => end = true,
             "-p" | "--patch" => patch = true,
+            "-N" | "--intent-to-add" => intent = true,
             "-A" | "--all" => all = true,
             "-u" | "--update" => update = true,
             "-f" | "--force" => force = true,
@@ -362,6 +364,10 @@ fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
         }
     }
     ensure!(!all || !update, "incompatible add options");
+    ensure!(
+        !intent || !patch,
+        "intent-to-add and patch are incompatible"
+    );
     ensure!(
         !names.is_empty() || all || update || patch,
         "add requires paths, --all, or --update"
@@ -395,6 +401,7 @@ fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
             targets.insert(
                 path,
                 Entry {
+                    flags: 0,
                     mode: 0o100644,
                     oid: Oid::ZERO,
                 },
@@ -403,6 +410,23 @@ fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
     }
     check_paths(&specs, &targets.keys().cloned().collect())?;
     let mut actual = checkout::snapshot(repo, &targets)?;
+    if intent {
+        let empty = crate::object::Object {
+            kind: crate::object::Kind::Blob,
+            data: Vec::new(),
+        };
+        repo.write_object(&empty)?;
+        for (path, entry) in &mut actual {
+            if !original_staged.contains_key(path)
+                || original_staged[path].flags & index::INTENT != 0
+            {
+                entry.oid = empty.oid()?;
+                entry.flags = index::INTENT;
+            } else {
+                *entry = original_staged[path];
+            }
+        }
+    }
     for (path, entry) in &mut actual {
         if entry.mode == 0o160000
             && let Some(id) = crate::submodule::head(repo, path)?
@@ -427,7 +451,50 @@ fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
     lock.commit("index")
 }
 
-fn restore(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Result<()> {
+pub(crate) fn legacy_restore(
+    cli: &Cli,
+    repo: &Repo,
+    store: &mut Store<'_>,
+    args: &[String],
+    reset: bool,
+) -> Result<()> {
+    let split = args
+        .iter()
+        .position(|a| a == "--")
+        .context("missing path separator")?;
+    let mut translated = Vec::new();
+    let mut revision = None;
+    for arg in &args[..split] {
+        match arg.as_str() {
+            "-q" | "--quiet" => {}
+            "-p" | "--patch" => translated.push("--patch".into()),
+            a if a.starts_with('-') => bail!("unsupported path restore option {a}"),
+            _ => {
+                ensure!(revision.is_none(), "one source revision is allowed");
+                revision = Some(arg);
+            }
+        }
+    }
+    if reset || revision.is_some() {
+        translated.push("--staged".into());
+    }
+    if !reset {
+        translated.push("--worktree".into());
+    }
+    if let Some(value) = revision {
+        translated.extend(["--source".into(), value.clone()]);
+    }
+    translated.push("--".into());
+    translated.extend_from_slice(&args[split + 1..]);
+    restore(cli, repo, store, &translated)
+}
+
+pub(crate) fn restore(
+    cli: &Cli,
+    repo: &Repo,
+    store: &mut Store<'_>,
+    args: &[String],
+) -> Result<()> {
     let mut patch = false;
     let (mut staged, mut worktree, mut end) = (false, false, false);
     let mut source = None;
@@ -547,6 +614,7 @@ fn restore(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
             },
         )
     } else {
+        crate::sparse::mark(repo, &mut after_index)?;
         save_index(
             repo,
             index_lock.as_mut().unwrap(),
@@ -787,16 +855,31 @@ fn status(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Res
         }
         let a = before.get(path).copied();
         let b = staged.get(path).copied();
-        let actual = if b.is_some_and(|e| e.mode == 0o160000) {
+        let actual = if b.is_some_and(|e| e.mode == 0o160000)
+            || (b.is_some_and(|e| e.flags & index::SKIP != 0) && work.state(path)?.is_none())
+        {
             b
         } else if b.is_some() {
             work.state(path)?
         } else {
             None
         };
-        let (x, y) = (change(a, b), change(b, actual));
+        let (x, y) = if b.is_some_and(|e| e.flags & index::INTENT != 0) {
+            (' ', if actual.is_some() { 'A' } else { 'D' })
+        } else {
+            (change(a, b), change(b, actual))
+        };
         if x != ' ' || y != ' ' {
-            rows.push((x, y, path.clone(), None, 100u32, a, b, actual));
+            rows.push((
+                x,
+                y,
+                path.clone(),
+                None,
+                100u32,
+                a,
+                b.filter(|e| e.flags & index::INTENT == 0),
+                actual,
+            ));
         }
     }
     // Pair staged additions and deletions. Exact matches first; bounded text similarity next.

@@ -35,6 +35,16 @@ pub fn save(repo: &Repo, boundary: &HashSet<Oid>) -> Result<()> {
             .as_bytes(),
     )
 }
+pub fn validate(store: &mut Store<'_>, seen: &HashSet<Oid>, offered: &HashSet<Oid>) -> Result<()> {
+    for id in store.shallow.clone() {
+        ensure!(
+            seen.contains(&id) || offered.contains(&id),
+            "unreachable shallow boundary"
+        );
+        store.get(id)?.commit()?;
+    }
+    Ok(())
+}
 pub fn boundary(store: &mut Store<'_>, tips: &[Oid], depth: u32) -> Result<HashSet<Oid>> {
     ensure!(depth > 0, "depth must be positive");
     let mut todo: VecDeque<_> = tips.iter().map(|id| (*id, 1u32)).collect();

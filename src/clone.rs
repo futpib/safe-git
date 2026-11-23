@@ -97,6 +97,8 @@ impl Destination {
 }
 
 pub struct Options<'a> {
+    pub filter: Option<&'a str>,
+    pub no_checkout: bool,
     pub depth: Option<u32>,
     pub branch: Option<&'a str>,
     pub remote: &'a str,
@@ -112,6 +114,9 @@ pub async fn run(
     auth: &Auth,
     options: Options<'_>,
 ) -> Result<()> {
+    if let Some(filter) = options.filter {
+        crate::partial::filter(filter)?;
+    }
     let url = network::normalize(url)?;
     crate::repo::tracking(options.remote, "check")?;
     let destination = Destination::new(destination)?;
@@ -152,7 +157,21 @@ pub async fn run(
         !selected.keys().any(|n| n.starts_with("refs/replace/")),
         "replacement refs are unsupported"
     );
-    let fetched = network::fetch_depth(&url, auth, &selected, &[], options.depth).await?;
+    let fetched = network::fetch_options(
+        &url,
+        auth,
+        &selected,
+        &[],
+        &network::FetchOptions {
+            depth: options.depth,
+            filter: options.filter.map(str::to_owned),
+            ..Default::default()
+        },
+    )
+    .await?;
+    if options.filter.is_some() {
+        crate::partial::store_pack(&repo, &fetched.objects)?;
+    }
     let mut store = Store::new(&repo);
     store.shallow = fetched.shallow;
     store.add(fetched.objects)?;
@@ -161,9 +180,11 @@ pub async fn run(
             store.get(*id)?.commit()?;
         }
     }
-    let ids = crate::object::reachable_many_since(
+    let ids = crate::partial::persist(
+        &repo,
         &mut store,
         &selected.values().copied().collect::<Vec<_>>(),
+        options.filter.is_some(),
         &std::collections::HashSet::new(),
     )?;
     ensure!(
@@ -174,9 +195,6 @@ pub async fn run(
         store.get(id)?.commit()?;
     }
     crate::shallow::save(&repo, &store.shallow)?;
-    for id in ids {
-        repo.write_object(store.get(id)?.as_ref())?;
-    }
     for (name, id) in &selected {
         let dest = if options.bare || name.starts_with("refs/tags/") {
             name.clone()
@@ -187,7 +205,37 @@ pub async fn run(
     }
     if let Some(tip) = expected {
         if !options.bare {
-            checkout::merge(&repo, &mut store, &repo.head()?, None, tip)?;
+            if !options.no_checkout {
+                if options.filter.is_some() {
+                    let entries = crate::index::tree(&mut store, Some(tip))?;
+                    let missing: std::collections::HashMap<_, _> = entries
+                        .values()
+                        .filter(|e| e.mode != 0o160000 && store.get(e.oid).is_err())
+                        .map(|e| (e.oid.to_string(), e.oid))
+                        .collect();
+                    if !missing.is_empty() {
+                        let objects = network::fetch_options(
+                            &url,
+                            auth,
+                            &missing,
+                            &[],
+                            &network::FetchOptions {
+                                raw: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await?
+                        .objects;
+                        for obj in objects.values() {
+                            repo.write_object(obj)?;
+                        }
+                        store.add(objects)?;
+                    }
+                }
+                checkout::merge(&repo, &mut store, &repo.head()?, None, tip)?;
+            } else {
+                repo.update_ref(&repo.head()?, None, tip)?;
+            }
             repo.atomic(
                 &format!("refs/remotes/{}/HEAD", options.remote),
                 format!("ref: refs/remotes/{}/{branch}\n", options.remote).as_bytes(),
@@ -211,11 +259,24 @@ pub async fn run(
         "[core]\n\trepositoryformatversion = 0\n\tbare = {}\n[remote {}]\n\turl = {}\n\tfetch = {}\n[branch {}]\n\tremote = {}\n\tmerge = {}\n",
         options.bare,quote(options.remote),quote(&url),quote(&refspec),quote(&branch),quote(options.remote),quote(&format!("refs/heads/{branch}")),
     ).as_bytes())?;
+    if let Some(filter) = options.filter {
+        let mut config = repo.read("config", 8 * 1024 * 1024)?.unwrap();
+        config.extend_from_slice(
+            format!(
+                "\n[remote {}]\n\tpromisor = true\n\tpartialCloneFilter = {}\n",
+                quote(options.remote),
+                quote(filter)
+            )
+            .as_bytes(),
+        );
+        repo.atomic("config", &config)?;
+    }
     destination.publish()?;
     // Bind both directory identity and its final location in trusted host state.
     trust::save(
         &repo,
         &trust::Binding {
+            filter: options.filter.map(str::to_owned),
             url,
             remote: options.remote.into(),
             branch,

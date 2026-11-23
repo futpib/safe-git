@@ -13,6 +13,8 @@ use std::{
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Binding {
+    #[serde(default)]
+    pub filter: Option<String>,
     pub url: String,
     pub remote: String,
     pub branch: String,

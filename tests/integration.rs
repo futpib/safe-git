@@ -14,6 +14,8 @@ mod http_packages;
 mod output;
 #[path = "suites/packages.rs"]
 mod packages;
+#[path = "suites/remaining.rs"]
+mod remaining;
 #[path = "support/mod.rs"]
 mod support;
 #[path = "suites/transfers.rs"]
@@ -37,6 +39,26 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("remaining_sparse", || {
+                remaining::sparse();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("remaining_network", || {
+                remaining::network();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("remaining_atomic_push", || {
+                remaining::atomic_push();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("remaining_editing", || {
+                remaining::editing();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("remaining_stashing", || {
+                remaining::stashing();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("completion_inspection", || {
                 completion::inspection();
                 Ok(())

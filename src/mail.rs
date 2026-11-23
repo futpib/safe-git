@@ -455,7 +455,14 @@ fn transform(
             };
             let oid = obj.oid()?;
             repo.write_object(&obj)?;
-            after.insert(p, Entry { mode: m, oid });
+            after.insert(
+                p,
+                Entry {
+                    flags: 0,
+                    mode: m,
+                    oid,
+                },
+            );
         } else {
             ensure!(data.is_empty(), "deletion patch leaves content");
         }

@@ -56,6 +56,7 @@ pub fn write_tree(repo: &Repo, entries: &Entries) -> Result<Oid> {
             items.push((
                 name,
                 Entry {
+                    flags: 0,
                     mode: 0o40000,
                     oid: build(repo, entries, depth + 1)?,
                 },
@@ -85,7 +86,11 @@ pub fn write_tree(repo: &Repo, entries: &Entries) -> Result<Oid> {
     }
     build(
         repo,
-        entries.iter().map(|(p, e)| (p.as_slice(), *e)).collect(),
+        entries
+            .iter()
+            .filter(|(_, e)| e.flags & index::INTENT == 0)
+            .map(|(p, e)| (p.as_slice(), *e))
+            .collect(),
         0,
     )
 }
@@ -160,6 +165,9 @@ pub struct CommitOptions {
     pub all: bool,
     pub quiet: bool,
     pub amend: bool,
+    pub allow_empty: bool,
+    pub author: Option<String>,
+    pub paths: Option<Vec<Vec<u8>>>,
 }
 pub fn commit(
     repo: &Repo,
@@ -168,7 +176,14 @@ pub fn commit(
     message: &str,
     options: CommitOptions,
 ) -> Result<()> {
-    let CommitOptions { all, quiet, amend } = options;
+    let CommitOptions {
+        all,
+        quiet,
+        amend,
+        allow_empty,
+        author: requested_author,
+        paths,
+    } = options;
     ensure!(!message.trim().is_empty(), "empty commit message");
     for state in [
         "safe-git-checkout",
@@ -197,16 +212,34 @@ pub fn commit(
         .map(|b| index::decode(b))
         .transpose()?
         .unwrap_or_default();
-    let entries = if all {
+    let mut index_after = staged.clone();
+    let entries = if let Some(specs) = &paths {
+        ensure!(!all, "commit paths and --all are incompatible");
+        let before = index::tree(store, old)?;
+        let mut candidates = before.clone();
+        candidates.extend(staged.clone());
+        crate::workflow::check_paths(specs, &candidates.keys().cloned().collect())?;
+        candidates.retain(|p, _| crate::workflow::selected(p, specs));
+        let actual = checkout::snapshot(repo, &candidates)?;
+        index_after.retain(|p, _| !crate::workflow::selected(p, specs));
+        index_after.extend(actual.clone());
+        let mut entries = before;
+        entries.retain(|p, _| !crate::workflow::selected(p, specs));
+        entries.extend(actual);
+        entries
+    } else if all {
         checkout::snapshot(repo, &staged)?
     } else {
         staged
     };
+    if paths.is_none() {
+        index_after = entries.clone();
+    }
     let tree = write_tree(repo, &entries)?;
     let before = index::tree(store, old)?;
     if let Some(old) = old {
         ensure!(
-            amend || store.get(old)?.commit()?.0 != tree,
+            allow_empty || amend || store.get(old)?.commit()?.0 != tree,
             "nothing to commit, working tree clean"
         );
     }
@@ -220,7 +253,37 @@ pub fn commit(
     } else {
         old.into_iter().collect::<Vec<_>>()
     };
-    let author = if let Some(obj) = &previous {
+    let author = if let Some(value) = requested_author {
+        let (name, rest) = value
+            .rsplit_once(" <")
+            .context("--author requires Name <email>")?;
+        let email = rest
+            .strip_suffix('>')
+            .context("--author requires Name <email>")?;
+        ensure!(
+            !name.is_empty()
+                && !email.is_empty()
+                && !name
+                    .chars()
+                    .chain(email.chars())
+                    .any(|c| c.is_control() || c == '<' || c == '>'),
+            "invalid author identity"
+        );
+        let dated = identity(repo, overrides, "COMMITTER")?;
+        let date = std::env::var("GIT_AUTHOR_DATE")
+            .unwrap_or_else(|_| dated.rsplit_once("> ").unwrap().1.into());
+        let date = date.trim_start_matches('@');
+        let fields: Vec<_> = date.split_whitespace().collect();
+        ensure!(
+            fields.len() == 2
+                && fields[0].parse::<u64>().is_ok()
+                && fields[1].len() == 5
+                && matches!(fields[1].as_bytes()[0], b'+' | b'-')
+                && fields[1].as_bytes()[1..].iter().all(u8::is_ascii_digit),
+            "invalid author date"
+        );
+        format!("{name} <{email}> {date}")
+    } else if let Some(obj) = &previous {
         author(&obj.data)?
     } else {
         identity(repo, overrides, "AUTHOR")?
@@ -250,7 +313,7 @@ pub fn commit(
         ),
     )?;
     // Commit records a snapshot. Never check it out over subsequent or unstaged edits.
-    index_lock.file.write_all(&index::encode(&entries)?)?;
+    index_lock.file.write_all(&index::encode(&index_after)?)?;
     index_lock.commit("index")?;
     ref_lock.commit(id)?;
     crate::history::finish_logs(logs)?;
@@ -465,7 +528,11 @@ pub(crate) fn three_way(
             };
             let oid = object.oid()?;
             repo.write_object(&object)?;
-            Some(Entry { mode, oid })
+            Some(Entry {
+                flags: 0,
+                mode,
+                oid,
+            })
         };
         if let Some(entry) = result {
             out.insert(path.clone(), entry);
