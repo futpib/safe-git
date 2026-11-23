@@ -227,7 +227,13 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             "format-patch",
             "fsck",
             "gc",
-            "sparse-checkout"
+            "sparse-checkout",
+            "verify-commit",
+            "verify-tag",
+            "bundle",
+            "notes",
+            "range-diff",
+            "rerere"
         ]
         .contains(&name),
         "unsupported Git command {name}; no external fallback is implemented"
@@ -261,6 +267,12 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
     );
     let mut store = Store::new(&repo);
     match name {
+        "verify-commit" | "verify-tag" => {
+            crate::signing::verify(cli, &repo, &mut store, name, items)
+        }
+        "bundle" | "notes" | "range-diff" | "rerere" => {
+            crate::extras::run(cli, &repo, &mut store, name, items)
+        }
         "fsck" | "gc" => crate::maintenance::run(&repo, &mut store, name, items, cli.quiet),
         "sparse-checkout" => crate::sparse::run(cli, &repo, &mut store, items),
         "grep" => crate::search::grep(cli, &repo, &mut store, items),
@@ -450,14 +462,27 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             repo.update_ref(&name, old, id)
         }
         "merge-base" => {
-            let pos = args(items, &["--is-ancestor"])?;
+            let pos = args(items, &["--is-ancestor", "--all", "-a"])?;
             ensure!(pos.len() == 2, "merge-base requires two revisions");
             let a = revision::commit(&repo, &mut store, pos[0])?;
             let b = revision::commit(&repo, &mut store, pos[1])?;
             if flag(items, "--is-ancestor") {
                 predicate(ancestor(&mut store, a, b)?)
             } else {
-                println!("{}", revision::merge_base(&mut store, a, b)?);
+                let bases = revision::merge_bases(&mut store, a, b)?;
+                if bases.is_empty() {
+                    return Err(Exit(1).into());
+                }
+                for id in bases
+                    .into_iter()
+                    .take(if flag(items, "--all") || flag(items, "-a") {
+                        usize::MAX
+                    } else {
+                        1
+                    })
+                {
+                    println!("{id}");
+                }
                 Ok(())
             }
         }

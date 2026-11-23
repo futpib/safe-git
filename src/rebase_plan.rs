@@ -40,7 +40,7 @@ pub fn graph(
     let mut tip = None;
     for mut step in steps {
         let parents = store.parents(step.id)?;
-        ensure!(parents.len() <= 2, "octopus rebase merges are unsupported");
+        ensure!(parents.len() <= 32, "too many merge parents");
         let mut targets = Vec::new();
         for parent in parents {
             let target = if visited.contains(&parent) {
@@ -179,7 +179,10 @@ pub fn interactive(steps: Vec<Step>, initial: &BTreeMap<String, Oid>) -> Result<
                 ensure!(known.contains_key(target), "unknown merge label");
                 step.targets.push(target.into());
             }
-            ensure!(step.targets.len() == 1, "merge requires one label");
+            ensure!(
+                !step.targets.is_empty() && step.targets.len() <= 31,
+                "merge requires 1 to 31 labels"
+            );
             if first == "-c" {
                 ensure!(!message.is_empty(), "merge -c requires # MESSAGE");
                 step.message = Some(message.into());

@@ -18,11 +18,14 @@ use std::{
 const LIMIT: usize = 16 * 1024 * 1024;
 
 pub fn read_input(cli: &Cli, name: &str) -> Result<Vec<u8>> {
+    read_input_limit(cli, name, LIMIT)
+}
+pub(crate) fn read_input_limit(cli: &Cli, name: &str, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     if name == "-" {
         std::io::stdin()
             .lock()
-            .take(LIMIT as u64 + 1)
+            .take(limit as u64 + 1)
             .read_to_end(&mut bytes)?;
     } else {
         let path = cli.repository.join(&cli.prefix).join(name);
@@ -57,9 +60,9 @@ pub fn read_input(cli: &Cli, name: &str) -> Result<Vec<u8>> {
         use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
         ensure!(meta.is_file() && meta.nlink() == 1, "unsafe input file");
-        file.take(LIMIT as u64 + 1).read_to_end(&mut bytes)?;
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
     }
-    ensure!(bytes.len() <= LIMIT, "input exceeds byte limit");
+    ensure!(bytes.len() <= limit, "input exceeds byte limit");
     Ok(bytes)
 }
 pub fn check_whitespace(path: &[u8], old: &[u8], new: &[u8]) -> Result<(bool, String)> {
@@ -650,7 +653,11 @@ fn apply(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Resu
     apply_changes(repo, store, &changes, cached, indexed, check, reverse)
 }
 
-fn patch_between(store: &mut Store<'_>, before: &Entries, after: &Entries) -> Result<Vec<u8>> {
+pub(crate) fn patch_between(
+    store: &mut Store<'_>,
+    before: &Entries,
+    after: &Entries,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut budget = LIMIT;
     for path in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {

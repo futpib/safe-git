@@ -541,6 +541,19 @@ impl Pending {
             committed: false,
         })
     }
+    pub(crate) fn commit_noreplace(&mut self, name: &str) -> Result<()> {
+        self.file.sync_all()?;
+        fs::renameat_with(
+            &self.dir,
+            self.name.as_str(),
+            &self.dir,
+            name,
+            fs::RenameFlags::NOREPLACE,
+        )?;
+        self.committed = true;
+        self.dir.sync_all()?;
+        Ok(())
+    }
     pub(crate) fn commit(&mut self, name: &str) -> Result<()> {
         self.file.sync_all()?;
         fs::renameat(&self.dir, self.name.as_str(), &self.dir, name)?;

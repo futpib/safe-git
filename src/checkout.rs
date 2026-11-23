@@ -72,11 +72,73 @@ impl<'a> Work<'a> {
         };
         entry_at(&dir, &name, self.device, self.format)
     }
+    fn regular_ancestor(&self, path: &[u8]) -> Result<bool> {
+        for (i, b) in path.iter().enumerate() {
+            if *b == b'/' {
+                match self.state(&path[..i])? {
+                    Some(e) if matches!(e.mode, 0o100644 | 0o100755) => return Ok(true),
+                    Some(e) => {
+                        ensure!(e.mode == 0o40000, "worktree parent is not a real directory")
+                    }
+                    None => return Ok(false),
+                }
+            }
+        }
+        Ok(false)
+    }
+    fn planned_state(&self, path: &[u8], removed: &BTreeSet<Vec<u8>>) -> Result<Option<Entry>> {
+        for (i, b) in path.iter().enumerate() {
+            if *b == b'/'
+                && removed.contains(&path[..i])
+                && self.state(&path[..i])?.is_some_and(|e| e.mode != 0o40000)
+            {
+                return Ok(None);
+            }
+        }
+        self.state(path)
+    }
+    fn removable_dirs(
+        &self,
+        path: &[u8],
+        removed: &BTreeSet<Vec<u8>>,
+        dirs: &mut BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        ensure!(
+            dirs.len() < MAX_OBJECTS && path.split(|b| *b == b'/').count() <= 128,
+            "directory transition exceeds limit"
+        );
+        dirs.insert(path.to_vec());
+        let (parent, name) = self.parent(path)?;
+        let dir = File::from(fs::openat(&parent, name.as_slice(), DIR, Mode::empty())?);
+        let mut count = 0;
+        for entry in fs::Dir::read_from(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            if matches!(name, b"." | b"..") {
+                continue;
+            }
+            count += 1;
+            ensure!(count <= MAX_OBJECTS, "directory scan exceeds limit");
+            let mut child = path.to_vec();
+            child.push(b'/');
+            child.extend_from_slice(name);
+            match self.state(&child)? {
+                Some(e) if e.mode == 0o40000 => self.removable_dirs(&child, removed, dirs)?,
+                Some(_) => ensure!(
+                    removed.contains(&child),
+                    "untracked data blocks directory transition"
+                ),
+                None => bail!("directory changed during checkout"),
+            }
+        }
+        Ok(())
+    }
     fn plan_directories(
         &self,
         path: &[u8],
         include_leaf: bool,
         dirs: &mut BTreeSet<Vec<u8>>,
+        removed: &BTreeSet<Vec<u8>>,
     ) -> Result<()> {
         let mut ends: Vec<_> = path
             .iter()
@@ -89,7 +151,11 @@ impl<'a> Work<'a> {
         }
         for end in ends {
             let prefix = &path[..end];
-            match self.state(prefix)? {
+            match if removed.contains(prefix) {
+                None
+            } else {
+                self.planned_state(prefix, removed)?
+            } {
                 None => {
                     dirs.insert(prefix.to_vec());
                 }
@@ -223,14 +289,27 @@ struct Journal {
     ref_lock: u64,
     changes: Vec<Change>,
     dirs: Vec<Vec<u8>>,
+    #[serde(default)]
+    removed_dirs: Vec<Vec<u8>>,
+    #[serde(default)]
+    removed_modes: Vec<u32>,
 }
 impl Journal {
     fn validate(&self) -> Result<()> {
         ensure!(
             (self.version == 1 || self.version == 2)
                 && self.changes.len() <= MAX_OBJECTS
-                && self.dirs.len() <= MAX_OBJECTS,
+                && self.dirs.len() <= MAX_OBJECTS
+                && self.removed_dirs.len() <= MAX_OBJECTS,
             "invalid checkout journal"
+        );
+        ensure!(
+            self.removed_modes.is_empty() || self.removed_modes.len() == self.removed_dirs.len(),
+            "invalid saved directory modes"
+        );
+        ensure!(
+            self.removed_modes.iter().all(|mode| mode & !0o7777 == 0),
+            "invalid directory permissions"
         );
         crate::repo::reference(&self.head)?;
         if self.version == 2 {
@@ -275,7 +354,7 @@ impl Journal {
                 ensure!(e.mode != 0o160000, "gitlink in file journal");
             }
         }
-        for dir in &self.dirs {
+        for dir in self.dirs.iter().chain(&self.removed_dirs) {
             index::path(dir)?;
         }
         Ok(())
@@ -423,6 +502,23 @@ fn apply_inner(
         .chain(conflicts.keys())
         .cloned()
         .collect();
+    let removed: BTreeSet<Vec<u8>> = before
+        .keys()
+        .chain(index.keys())
+        .filter(|p| !after.contains_key(*p))
+        .cloned()
+        .collect();
+    let mut removed_dirs = BTreeSet::new();
+    for path in after.keys() {
+        if work
+            .planned_state(path, &removed)?
+            .is_some_and(|e| e.mode == 0o40000)
+            && !before.get(path).is_some_and(|e| e.mode == 0o160000)
+            && after[path].mode != 0o160000
+        {
+            work.removable_dirs(path, &removed, &mut removed_dirs)?;
+        }
+    }
     let mut changes = Vec::new();
     let mut contents = Vec::<Option<Arc<Object>>>::new();
     let mut dirs = BTreeSet::new();
@@ -491,11 +587,15 @@ fn apply_inner(
                 "submodule/file transitions are unsupported"
             );
             if a.is_none() {
-                work.plan_directories(&path, true, &mut dirs)?;
+                work.plan_directories(&path, true, &mut dirs, &removed)?;
             }
             // Gitlink updates affect only the index. Existing submodule contents are untouched.
         } else {
-            let actual = work.state(&path)?;
+            let actual = if removed_dirs.contains(&path) {
+                None
+            } else {
+                work.planned_state(&path, &removed)?
+            };
             ensure!(
                 force || actual == a || (actual.is_none() && b.is_none()),
                 "local changes or untracked data would be overwritten at {:?}",
@@ -503,7 +603,7 @@ fn apply_inner(
             );
             if actual != b {
                 let content = if let Some(entry) = b {
-                    work.plan_directories(&path, false, &mut dirs)?;
+                    work.plan_directories(&path, false, &mut dirs, &removed)?;
                     let object = store.get(entry.oid)?;
                     ensure!(object.kind == Kind::Blob, "checkout entry is not a blob");
                     total += object.data.len();
@@ -554,6 +654,19 @@ fn apply_inner(
         ref_lock: ref_update.lock.file.metadata()?.ino(),
         changes,
         dirs: dirs.into_iter().collect(),
+        removed_modes: removed_dirs
+            .iter()
+            .map(|path| {
+                let (dir, name) = work.parent(path)?;
+                let stat = fs::statat(&dir, name.as_slice(), AtFlags::SYMLINK_NOFOLLOW)?;
+                ensure!(
+                    stat.st_mode & 0o170000 == 0o40000,
+                    "directory changed during checkout"
+                );
+                Ok(stat.st_mode & 0o7777)
+            })
+            .collect::<Result<Vec<_>>>()?,
+        removed_dirs: removed_dirs.into_iter().collect(),
     };
     journal.validate()?;
     let journal_bytes = serde_json::to_vec(&journal)?;
@@ -588,39 +701,59 @@ fn apply_inner(
         return Err(error);
     }
     let apply = (|| -> Result<()> {
-        for path in &journal.dirs {
-            let (dir, name) = work.parent(path)?;
-            fs::mkdirat(&dir, name.as_slice(), Mode::from_raw_mode(0o755))?;
-            dir.sync_all()?;
-        }
-        for (i, change) in journal.changes.iter().enumerate() {
+        // Back up every old leaf before changing directory topology. Never move
+        // a directory into the transaction: untracked content stays in place.
+        for (i, change) in journal
+            .changes
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.old.is_some())
+        {
             ensure!(
                 work.state(&change.path)? == change.old,
                 "worktree changed during checkout"
             );
             let (dir, name) = work.parent(&change.path)?;
-            if change.old.is_some() {
-                fs::renameat_with(
-                    &dir,
-                    name.as_slice(),
-                    &txn,
-                    format!("old-{i}"),
-                    RenameFlags::NOREPLACE,
-                )?;
-                dir.sync_all()?;
-                txn.sync_all()?;
-            }
-            if change.new.is_some() {
-                fs::renameat_with(
-                    &txn,
-                    format!("new-{i}"),
-                    &dir,
-                    name.as_slice(),
-                    RenameFlags::NOREPLACE,
-                )?;
-                dir.sync_all()?;
-                txn.sync_all()?;
-            }
+            fs::renameat_with(
+                &dir,
+                name.as_slice(),
+                &txn,
+                format!("old-{i}"),
+                RenameFlags::NOREPLACE,
+            )?;
+            dir.sync_all()?;
+            txn.sync_all()?;
+        }
+        for path in journal.removed_dirs.iter().rev() {
+            let (dir, name) = work.parent(path)?;
+            fs::unlinkat(&dir, name.as_slice(), AtFlags::REMOVEDIR)?;
+            dir.sync_all()?;
+        }
+        for path in &journal.dirs {
+            let (dir, name) = work.parent(path)?;
+            fs::mkdirat(&dir, name.as_slice(), Mode::from_raw_mode(0o755))?;
+            dir.sync_all()?;
+        }
+        for (i, change) in journal
+            .changes
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.new.is_some())
+        {
+            ensure!(
+                work.state(&change.path)?.is_none(),
+                "worktree changed during checkout"
+            );
+            let (dir, name) = work.parent(&change.path)?;
+            fs::renameat_with(
+                &txn,
+                format!("new-{i}"),
+                &dir,
+                name.as_slice(),
+                RenameFlags::NOREPLACE,
+            )?;
+            dir.sync_all()?;
+            txn.sync_all()?;
         }
         ensure!(
             repo.read("HEAD", 2048)?.as_deref() == Some(head_before.as_slice()),
@@ -684,6 +817,9 @@ pub fn snapshot(repo: &Repo, entries: &Entries) -> Result<Entries> {
             result.insert(path.clone(), *entry);
             continue;
         }
+        if work.regular_ancestor(path)? {
+            continue;
+        }
         let (dir, name) = match work.parent(path) {
             Ok(v) => v,
             Err(e) if missing(&e) => continue,
@@ -692,6 +828,13 @@ pub fn snapshot(repo: &Repo, entries: &Entries) -> Result<Entries> {
         let Some(actual) = entry_at(&dir, &name, work.device, repo.format)? else {
             continue;
         };
+        if actual.mode == 0o40000 {
+            ensure!(
+                !entry.oid.is_zero(),
+                "embedded repositories require explicit submodule registration"
+            );
+            continue;
+        }
         index::mode(actual.mode)?;
         let data = if actual.mode == 0o120000 {
             fs::readlinkat(&dir, name.as_slice(), Vec::new())?.into_bytes()
@@ -852,54 +995,85 @@ pub fn recover(repo: &Repo) -> Result<()> {
         current_hash == journal.index_old || current_hash == Some(journal.index_new),
         "index changed since interrupted checkout"
     );
+    // First undo installed new leaves, then undo directory changes, and only
+    // then restore old leaves. Staged names also make rollback restartable.
+    let removed: BTreeSet<_> = journal
+        .changes
+        .iter()
+        .filter(|c| c.new.is_none())
+        .map(|c| c.path.clone())
+        .collect();
     for (i, change) in journal.changes.iter().enumerate().rev() {
-        let backup = format!("old-{i}");
         let staged = format!("new-{i}");
-        let has_backup = exists_at(&txn, &backup)?;
-        let has_staged = exists_at(&txn, &staged)?;
+        if change.new.is_some() && !exists_at(&txn, &staged)? {
+            let actual = work.planned_state(&change.path, &removed)?;
+            if actual == change.new {
+                let (dir, name) = work.parent(&change.path)?;
+                fs::renameat_with(&dir, name.as_slice(), &txn, &staged, RenameFlags::NOREPLACE)?;
+                dir.sync_all()?;
+                txn.sync_all()?;
+            } else {
+                ensure!(
+                    actual == change.old && !exists_at(&txn, &format!("old-{i}"))?,
+                    "new user edits block recovery; backup retained"
+                );
+            }
+        }
+    }
+    for path in journal.dirs.iter().rev() {
+        if work
+            .planned_state(path, &removed)?
+            .is_some_and(|e| e.mode == 0o40000)
+        {
+            let (dir, name) = work.parent(path)?;
+            match fs::unlinkat(&dir, name.as_slice(), AtFlags::REMOVEDIR) {
+                Ok(()) => dir.sync_all()?,
+                Err(Errno::NOTEMPTY)
+                    if !journal
+                        .changes
+                        .iter()
+                        .any(|c| c.path == *path && c.old.is_some()) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    for (i, path) in journal.removed_dirs.iter().enumerate() {
+        if work.state(path)?.is_none() {
+            let (dir, name) = work.parent(path)?;
+            let mode = Mode::from_raw_mode(journal.removed_modes.get(i).copied().unwrap_or(0o755));
+            fs::mkdirat(&dir, name.as_slice(), mode)?;
+            let child = File::from(fs::openat(&dir, name.as_slice(), DIR, Mode::empty())?);
+            fs::fchmod(&child, mode)?;
+            child.sync_all()?;
+            dir.sync_all()?;
+        }
+    }
+    for (i, change) in journal
+        .changes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.old.is_some())
+    {
+        let backup = format!("old-{i}");
         let actual = work.state(&change.path)?;
-        if has_backup {
+        if exists_at(&txn, &backup)? {
             ensure!(
                 entry_at(&txn, backup.as_bytes(), work.device, repo.format)? == change.old,
                 "worktree backup does not match journal"
             );
+            ensure!(
+                actual.is_none(),
+                "new user edits block recovery; backup retained"
+            );
             let (dir, name) = work.parent(&change.path)?;
-            if actual.is_some() {
-                ensure!(
-                    !has_staged && actual == change.new,
-                    "new user edits block recovery; backup retained"
-                );
-                fs::unlinkat(&dir, name.as_slice(), AtFlags::empty())?;
-            }
-            fs::renameat_with(
-                &txn,
-                backup.as_str(),
-                &dir,
-                name.as_slice(),
-                RenameFlags::NOREPLACE,
-            )?;
+            fs::renameat_with(&txn, &backup, &dir, name.as_slice(), RenameFlags::NOREPLACE)?;
             dir.sync_all()?;
             txn.sync_all()?;
-        } else if change.old.is_none() && !has_staged && actual.is_some() {
-            ensure!(actual == change.new, "new user edits block recovery");
-            let (dir, name) = work.parent(&change.path)?;
-            fs::unlinkat(&dir, name.as_slice(), AtFlags::empty())?;
-            dir.sync_all()?;
-        } else if change.old.is_some() {
+        } else {
             ensure!(
                 actual == change.old,
                 "original file changed or its backup is missing; recover manually"
             );
-        }
-    }
-    for path in journal.dirs.iter().rev() {
-        if work.state(path)?.is_some() {
-            let (dir, name) = work.parent(path)?;
-            match fs::unlinkat(&dir, name.as_slice(), AtFlags::REMOVEDIR) {
-                Ok(()) => dir.sync_all()?,
-                Err(Errno::NOTEMPTY) => {}
-                Err(e) => return Err(e.into()),
-            }
         }
     }
     if let Some(bytes) = old_index {

@@ -50,6 +50,8 @@ pub struct Link {
     pub work: Identity,
     pub metadata: Identity,
     pub common: Identity,
+    #[serde(default)]
+    pub locked: Option<String>,
 }
 pub fn location(file: &File) -> Result<PathBuf> {
     Ok(std::fs::read_link(format!(
@@ -162,6 +164,22 @@ pub fn available(repo: &Repo, branch: &str) -> Result<()> {
     Ok(())
 }
 pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Result<()> {
+    // Registrations cover multiple repositories: serialize read/modify/write
+    // across all of them, in addition to the per-repository metadata lock.
+    let state_dir = File::from(fs::open(trust::directory()?, DIR, Mode::empty())?);
+    let registry_lock = File::from(fs::openat(
+        &state_dir,
+        "worktrees.lock",
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?);
+    let stat = registry_lock.metadata()?;
+    ensure!(
+        stat.is_file() && stat.nlink() == 1 && stat.mode() & 0o022 == 0,
+        "unsafe worktree registry lock"
+    );
+    fs::flock(&registry_lock, fs::FlockOperation::NonBlockingLockExclusive)
+        .context("worktree registry is locked")?;
     let command = args.first().map(String::as_str).unwrap_or("list");
     let common = repo.common.as_ref().unwrap_or(&repo.root);
     let mut links = records()?;
@@ -281,6 +299,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
             let mut linked =
                 Repo::lock(File::from(fs::open(metadata.path(), DIR, Mode::empty())?))?;
             linked.common = Some(common.try_clone()?);
+            linked.format = repo.format;
             linked.shallow = crate::shallow::read(&linked)?;
             linked.worktree = Some(open_directory(stage.path())?);
             linked.atomic("HEAD", format!("{id}\n").as_bytes())?;
@@ -327,6 +346,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                 work: Identity::of(linked.worktree.as_ref().unwrap())?,
                 metadata: Identity::of(&linked.root)?,
                 common: Identity::of(common)?,
+                locked: None,
             });
             save(&links)?;
         }
@@ -340,6 +360,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                 .position(|l| l.work.path == path)
                 .context("worktree is not registered")?;
             let l = links[at].clone();
+            ensure!(l.locked.is_none(), "worktree is locked; unlock it first");
             ensure!(
                 l.common.matches(common)? && !l.metadata.matches(&repo.root)?,
                 "not another worktree of this repository"
@@ -349,6 +370,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
             if !force {
                 let mut other = Repo::lock(meta.try_clone()?)?;
                 other.common = Some(common.try_clone()?);
+                other.format = repo.format;
                 other.worktree = Some(work.try_clone()?);
                 let index = porcelain::index(&other)?;
                 let mut objects = Store::new(&other);
@@ -367,14 +389,204 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
             links.remove(at);
             save(&links)?;
         }
+        "lock" | "unlock" => {
+            let mut reason = "locked".to_owned();
+            let mut values = Vec::new();
+            let mut items = args[1..].iter();
+            while let Some(a) = items.next() {
+                match a.as_str() {
+                    "--reason" | "-r" => {
+                        reason = items.next().context("missing lock reason")?.clone()
+                    }
+                    a if a.starts_with('-') => bail!("unsupported lock option {a}"),
+                    _ => values.push(a),
+                }
+            }
+            ensure!(
+                values.len() == 1 && reason.len() <= 4096 && !reason.contains(['\n', '\r', '\0']),
+                "lock requires PATH and a short reason"
+            );
+            let work = open_directory(&caller_path(cli, values[0])?)?;
+            let at = links
+                .iter()
+                .position(|l| l.work.matches(&work).unwrap_or(false))
+                .context("unregistered worktree")?;
+            ensure!(
+                links[at].common.matches(common)?,
+                "worktree belongs to another repository"
+            );
+            let metadata = links[at].metadata.open()?;
+            let other = Repo::lock(metadata)?;
+            if command == "lock" {
+                ensure!(links[at].locked.is_none(), "worktree already locked");
+                other.atomic("locked", reason.as_bytes())?;
+                links[at].locked = Some(reason);
+            } else {
+                other.remove("locked")?;
+                links[at].locked = None;
+            }
+            save(&links)?;
+        }
+        "move" => {
+            ensure!(args.len() == 3, "worktree move requires FROM TO");
+            let old = caller_path(cli, &args[1])?;
+            let dest = caller_path(cli, &args[2])?;
+            let work = open_directory(&old)?;
+            let at = links
+                .iter()
+                .position(|l| l.work.matches(&work).unwrap_or(false))
+                .context("unregistered worktree")?;
+            let l = links[at].clone();
+            ensure!(
+                l.common.matches(common)? && !l.metadata.matches(&repo.root)?,
+                "cannot move this worktree"
+            );
+            ensure!(l.locked.is_none(), "worktree is locked; unlock it first");
+            let metadata = l.metadata.open()?;
+            let other = Repo::lock(metadata)?;
+            ensure!(
+                !other.exists("safe-git-checkout")?,
+                "recover checkout before moving worktree"
+            );
+            let from = open_directory(old.parent().context("missing source parent")?)?;
+            let to = open_directory(dest.parent().context("missing destination parent")?)?;
+            fs::renameat_with(
+                &from,
+                old.file_name().unwrap(),
+                &to,
+                dest.file_name().context("invalid destination")?,
+                fs::RenameFlags::NOREPLACE,
+            )?;
+            from.sync_all()?;
+            to.sync_all()?;
+            // A crash before the registration is saved can be repaired by the
+            // caller naming the moved directory; its device/inode must match.
+            other.atomic(
+                "gitdir",
+                format!("{}\n", dest.join(".git").display()).as_bytes(),
+            )?;
+            links[at].work = Identity::of(&work)?;
+            save(&links)?;
+        }
+        "repair" => {
+            let paths = if args.len() == 1 {
+                links
+                    .iter()
+                    .filter(|l| same_inode(&l.common, common).unwrap_or(false))
+                    .map(|l| l.work.path.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                args[1..]
+                    .iter()
+                    .map(|p| caller_path(cli, p))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            for path in paths {
+                let work = open_directory(&path)?;
+                let at = links
+                    .iter()
+                    .position(|l| same_inode(&l.work, &work).unwrap_or(false))
+                    .context("no host registration matches this worktree inode")?;
+                let l = links[at].clone();
+                ensure!(
+                    same_inode(&l.common, common)?,
+                    "worktree belongs to another repository"
+                );
+                let relative = l
+                    .metadata
+                    .path
+                    .strip_prefix(&l.common.path)
+                    .context("invalid registered metadata location")?;
+                let metadata = open_directory(&location(common)?.join(relative))?;
+                ensure!(
+                    same_inode(&l.metadata, &metadata)?,
+                    "registered metadata was replaced"
+                );
+                let other = Repo::lock(metadata)?;
+                // Replace pointer files as inert bytes. Never use their old
+                // contents to choose the metadata or common directory.
+                other.atomic("commondir", b"../..\n")?;
+                other.atomic(
+                    "gitdir",
+                    format!("{}\n", path.join(".git").display()).as_bytes(),
+                )?;
+                let mut pointer = crate::repo::Pending::new(work.try_clone()?, ".git.lock".into())?;
+                pointer.file.write_all(
+                    format!("gitdir: {}\n", location(&other.root)?.display()).as_bytes(),
+                )?;
+                pointer.commit(".git")?;
+                links[at].work = Identity::of(&work)?;
+                links[at].metadata = Identity::of(&other.root)?;
+                links[at].common = Identity::of(common)?;
+                save(&links)?;
+            }
+        }
         "prune" => {
             ensure!(args.len() == 1, "unsupported prune option");
-            links.retain(|l| l.work.open().is_ok());
+            links.retain(|l| {
+                !l.common.matches(common).unwrap_or(false)
+                    || l.locked.is_some()
+                    || l.work.open().is_ok()
+            });
             save(&links)?;
         }
         _ => bail!("unsupported worktree command {command}"),
     }
     Ok(())
+}
+fn same_inode(identity: &Identity, file: &File) -> Result<bool> {
+    let stat = file.metadata()?;
+    Ok(identity.dev == stat.dev() && identity.ino == stat.ino())
+}
+fn caller_path(cli: &Cli, value: &str) -> Result<PathBuf> {
+    let path = std::env::current_dir()?
+        .join(&cli.repository)
+        .join(&cli.prefix)
+        .join(value);
+    let mut out = PathBuf::from("/");
+    for part in path.components() {
+        match part {
+            std::path::Component::Normal(p) => out.push(p),
+            std::path::Component::ParentDir => {
+                ensure!(out.pop(), "path escapes root");
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+pub fn protected_worktrees(repo: &Repo) -> Result<Vec<Repo>> {
+    let common = repo.common.as_ref().unwrap_or(&repo.root);
+    let mut out = Vec::new();
+    let registrations = records()?;
+    if repo.exists("worktrees")? {
+        let (dir, _) = repo.parent("worktrees/.scan", false)?;
+        for entry in fs::Dir::read_from(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            if matches!(name, b"." | b"..") {
+                continue;
+            }
+            let metadata = File::from(fs::openat(&dir, name, DIR, Mode::empty())?);
+            ensure!(
+                registrations
+                    .iter()
+                    .any(|l| l.common.matches(common).unwrap_or(false)
+                        && l.metadata.matches(&metadata).unwrap_or(false)),
+                "unregistered worktree metadata prevents pruning"
+            );
+        }
+    }
+    for link in registrations {
+        if link.common.matches(common)? && !link.metadata.matches(&repo.root)? {
+            let mut other = Repo::lock(link.metadata.open()?)?;
+            other.common = Some(common.try_clone()?);
+            other.format = repo.format;
+            other.worktree = Some(link.work.open()?);
+            out.push(other);
+        }
+    }
+    Ok(out)
 }
 use crate::index;
 pub fn remove_directory(identity: &Identity) -> Result<()> {

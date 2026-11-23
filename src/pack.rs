@@ -102,6 +102,9 @@ pub fn decode(data: &[u8]) -> Result<Objects> {
     decode_for(data, object::Format::Sha1)
 }
 pub fn decode_for(data: &[u8], format: object::Format) -> Result<Objects> {
+    decode_with(data, format, &Objects::new())
+}
+pub fn decode_with(data: &[u8], format: object::Format, bases: &Objects) -> Result<Objects> {
     let hash_len = format.bytes();
     ensure!(
         (12 + hash_len..=MAX_PACK).contains(&data.len()),
@@ -200,9 +203,14 @@ pub fn decode_for(data: &[u8], format: object::Format) -> Result<Objects> {
                 Base::Offset(n) => offsets.get(&n).copied(),
                 Base::Id(id) => Some(id),
             };
-            let base = id.and_then(|id| objects.get(&id).map(|obj| (id, Arc::clone(obj))));
+            let base = id.and_then(|id| {
+                objects
+                    .get(&id)
+                    .or_else(|| bases.get(&id))
+                    .map(|obj| (id, Arc::clone(obj)))
+            });
             if let Some((id, base)) = base {
-                let depth = depths[&id] + 1;
+                let depth = depths.get(&id).copied().unwrap_or(0) + 1;
                 ensure!(depth <= 64, "delta chain exceeds limit");
                 let body = apply_delta(&base.data, &delta.data)?;
                 inflated = inflated

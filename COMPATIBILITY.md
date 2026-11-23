@@ -18,8 +18,12 @@ Inspection includes show, blame, path-filtered log, --all/--graph/--decorate,
 word/whitespace/rename diffs, diff --check/--name-status, three-dot
 diffs, and lightweight/annotated tag creation, listing, and deletion.
 Merge, cherry-pick, revert, and rebase support conflicts and continue/abort.
+Merges combine multiple merge bases recursively; unrelated roots require
+`merge --allow-unrelated-histories`. Checkout handles file/directory transitions
+without discarding untracked contents.
 Pull supports --rebase; rebase supports --root, --autostash, --onto, --autosquash,
-and --rebase-merges for two-parent merges. Interactive rebase displays its proposed plan and reads
+and --rebase-merges, including conflict-free octopus merges. Interactive rebase
+displays its proposed plan and reads
 pick/reword/edit/squash/fixup/drop/break and label/reset/merge actions from stdin.
 Enter `done` to submit; `done` alone keeps the proposed plan. Reword messages go
 on the action line; `merge -c` takes `# MESSAGE`. No editor or exec action runs.
@@ -65,18 +69,31 @@ host-owned registrations. Clone and push -u remember endpoints/upstreams there.
 Existing repositories need an explicit URL or registration with remote add or
 config remote.NAME.url. Repository URLs and rewrites never select endpoints.
 
-Worktree add/list/remove/prune uses shared objects and refs, with host records
-binding linked directories to their locations and filesystem identities.
-Unregistered gitdir/commondir pointers are refused. Submodule add accepts a
-caller URL; existing gitlinks need `submodule init --url URL -- PATH` before
+Worktree add/list/remove/prune/move/lock/unlock/repair uses shared objects and
+refs, with host records binding directories to their locations and identities.
+Repair accepts moved directories only when their device/inode matches a host
+registration. Unregistered gitdir/commondir pointers are refused. Submodule add
+accepts a caller URL; existing gitlinks need `submodule init --url URL -- PATH` before
 `submodule update`. Recursive updates require each submodule endpoint to be registered individually;
 .gitmodules URLs and update commands are never followed. Status and deinit are
 supported; deinit retains local repositories in .git/safe-git-submodules.
 
 `fsck` verifies local object hashes and graph references without fetching. `gc`
-packs verified objects without expiring unreachable history. `commit -S` signs
-in-process with an OpenSSH key selected by --signing-key or SAFE_GIT_SIGNING_KEY;
-repository signing settings cannot select a key or program.
+packs verified objects; `gc --prune=now` explicitly removes unreachable objects,
+protecting refs, reflogs, indexes, linked worktrees, and recorded resolutions.
+`reflog expire --expire=now --all` explicitly expires reflogs. Pruning refuses
+active operations, unregistered worktrees, and kept/promisor packs. `commit -S` signs
+in-process with an OpenSSH key selected by --signing-key or SAFE_GIT_SIGNING_KEY.
+Signed tags use `tag -s` with the same key selection. `verify-commit` and
+`verify-tag` require an OpenSSH public key selected by `--verification-key` or
+`SAFE_GIT_VERIFICATION_KEY`; repository settings cannot select keys or trust.
+
+Bundle create/verify/list-heads/unbundle supports SHA-1/SHA-256, prerequisites,
+and thin packs resolved from verified local objects. Notes support list/show,
+add/append/edit/copy/remove with explicit messages. Range-diff pairs patches and
+shows changes without external diffs. Explicit `rerere` records and reuses
+resolutions; status/remaining/diff/forget/clear manage its separate bounded cache.
+Reused resolutions remain unstaged for review.
 
 Paru/makepkg workflows remain covered. Hooks, filters, aliases, external signers,
 includes, external diffs, merge drivers, and executable sequencer instructions

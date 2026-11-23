@@ -98,6 +98,79 @@ fn load(repo: &Repo) -> Result<State> {
     ensure!(repo.head()? == state.branch, "sequence branch changed");
     Ok(state)
 }
+// Recursively combine best common ancestors using the same inert tree merger.
+// Virtual commits remain objects only; no ref or checkout points to them.
+fn base_tree(repo: &Repo, store: &mut Store<'_>, a: Oid, b: Oid, depth: usize) -> Result<Entries> {
+    base_tree_inner(repo, store, a, b, depth, &mut 256)
+}
+fn base_tree_inner(
+    repo: &Repo,
+    store: &mut Store<'_>,
+    a: Oid,
+    b: Oid,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<Entries> {
+    *budget = budget
+        .checked_sub(1)
+        .context("merge-base work budget exceeded")?;
+    ensure!(depth <= 64, "merge-base recursion exceeds limit");
+    let bases = revision::merge_bases(store, a, b)?;
+    let Some(mut tip) = bases.first().copied() else {
+        return Ok(Entries::new());
+    };
+    for other in bases.into_iter().skip(1) {
+        let base = base_tree_inner(repo, store, tip, other, depth + 1, budget)?;
+        let ours = porcelain::tree(store, tip)?;
+        let theirs = porcelain::tree(store, other)?;
+        let (mut work, _, conflicts) = merge_trees(repo, store, &base, &ours, &theirs)?;
+        for (path, stages) in conflicts {
+            // Binary/type conflicts need an unambiguous synthetic base, so
+            // differing final sides require review instead of favoring a base.
+            let textual = stages
+                .iter()
+                .flatten()
+                .all(|e| matches!(e.mode, 0o100644 | 0o100755))
+                && stages
+                    .iter()
+                    .flatten()
+                    .map(|e| store.get(e.oid))
+                    .collect::<Result<Vec<_>>>()?
+                    .iter()
+                    .all(|o| !o.data.contains(&0));
+            if !textual {
+                let data = [
+                    b"\0safe-git ambiguous merge base\0".as_slice(),
+                    &serde_json::to_vec(&stages)?,
+                ]
+                .concat();
+                let object = Object {
+                    kind: Kind::Blob,
+                    data,
+                };
+                repo.write_object(&object)?;
+                work.insert(
+                    path,
+                    crate::index::Entry {
+                        mode: 0o100644,
+                        flags: 0,
+                        oid: object.oid_for(repo.format)?,
+                    },
+                );
+            }
+        }
+        let tree = porcelain::write_tree(repo, &work)?;
+        tip = porcelain::new_commit(
+            repo,
+            tree,
+            &[tip, other],
+            "safe-git <virtual@invalid> 0 +0000",
+            "safe-git <virtual@invalid> 0 +0000",
+            b"virtual merge base",
+        )?;
+    }
+    porcelain::tree(store, tip)
+}
 fn clean(repo: &Repo, store: &mut Store<'_>, tip: Oid) -> Result<()> {
     ensure!(
         porcelain::index(repo)? == porcelain::tree(store, tip)?,
@@ -356,20 +429,42 @@ fn advance(cli: &Cli, repo: &Repo, store: &mut Store<'_>, state: &mut State) -> 
                 .iter()
                 .map(|l| state.labels.get(l).copied().context("unknown merge label"))
                 .collect::<Result<Vec<_>>>()?;
-            ensure!(others.len() == 1, "octopus rebase merges are unsupported");
-            state.rebase_parents = vec![state.current, others[0]];
-            let base = revision::merge_base(store, state.current, others[0])?;
-            (
-                porcelain::tree(store, base)?,
-                porcelain::tree(store, others[0])?,
-            )
+            state.rebase_parents = std::iter::once(state.current)
+                .chain(others.iter().copied())
+                .collect();
+            if others.len() > 1 {
+                let mut tip = state.current;
+                let mut merged = porcelain::tree(store, tip)?;
+                for other in others {
+                    let base = base_tree(repo, store, tip, other, 0)?;
+                    let theirs = porcelain::tree(store, other)?;
+                    let (work, _, conflicts) = merge_trees(repo, store, &base, &merged, &theirs)?;
+                    ensure!(
+                        conflicts.is_empty(),
+                        "octopus merge conflicts; abort and merge the branches individually"
+                    );
+                    merged = work;
+                    let tree = porcelain::write_tree(repo, &merged)?;
+                    tip = porcelain::new_commit(
+                        repo,
+                        tree,
+                        &[tip, other],
+                        "safe-git <virtual@invalid> 0 +0000",
+                        "safe-git <virtual@invalid> 0 +0000",
+                        b"virtual octopus merge",
+                    )?;
+                }
+                (porcelain::tree(store, state.current)?, merged)
+            } else {
+                (
+                    base_tree(repo, store, state.current, others[0], 0)?,
+                    porcelain::tree(store, others[0])?,
+                )
+            }
         } else if state.kind == "merge" {
             {
-                let base = revision::merge_base(store, state.current, step.id)?;
-                (
-                    porcelain::tree(store, base)?,
-                    porcelain::tree(store, step.id)?,
-                )
+                let base = base_tree(repo, store, state.current, step.id, 0)?;
+                (base, porcelain::tree(store, step.id)?)
             }
         } else {
             let parent = if parents.len() > 1 {
@@ -776,8 +871,7 @@ pub fn merge(
     save(repo, &state)?;
     // A no-commit merge remains resumable; ordinary cherry-pick -n does not.
     if no_commit {
-        let base = revision::merge_base(store, old, incoming)?;
-        let a = porcelain::tree(store, base)?;
+        let a = base_tree(repo, store, old, incoming, 0)?;
         let b = porcelain::tree(store, old)?;
         let c = porcelain::tree(store, incoming)?;
         let (work, index, conflicts) = merge_trees(repo, store, &a, &b, &c)?;

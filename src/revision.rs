@@ -229,7 +229,7 @@ pub fn history(
     }
     Ok(out)
 }
-pub fn merge_base(store: &mut impl ReadObjects, a: Oid, b: Oid) -> Result<Oid> {
+pub fn merge_bases(store: &mut impl ReadObjects, a: Oid, b: Oid) -> Result<Vec<Oid>> {
     let left = commits(store, &[a])?;
     let right = commits(store, &[b])?;
     let common: HashSet<_> = left.intersection(&right).copied().collect();
@@ -241,10 +241,13 @@ pub fn merge_base(store: &mut impl ReadObjects, a: Oid, b: Oid) -> Result<Oid> {
             }
         }
     }
-    let best: Vec<_> = common.difference(&ancestors).copied().collect();
-    ensure!(
-        best.len() == 1,
-        "unrelated histories or multiple merge bases are unsupported"
-    );
-    Ok(best[0])
+    let mut best: Vec<_> = common.difference(&ancestors).copied().collect();
+    best.sort();
+    Ok(best)
+}
+pub fn merge_base(store: &mut impl ReadObjects, a: Oid, b: Oid) -> Result<Oid> {
+    merge_bases(store, a, b)?
+        .first()
+        .copied()
+        .context("unrelated histories")
 }

@@ -15,6 +15,7 @@ pub fn is_mutation(args: &[String]) -> bool {
 pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Result<()> {
     let (mut force, mut delete, mut annotated) = (false, false, false);
     let mut message = None;
+    let mut signed = false;
     let mut values = Vec::new();
     let mut items = args.iter();
     let mut end = false;
@@ -28,6 +29,10 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
             "-f" | "--force" => force = true,
             "-d" | "--delete" => delete = true,
             "-a" | "--annotate" => annotated = true,
+            "-s" | "--sign" => {
+                annotated = true;
+                signed = true;
+            }
             "-m" | "--message" => {
                 annotated = true;
                 message = Some(items.next().context("missing tag message")?);
@@ -68,7 +73,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
             let message =
                 message.context("annotated tags require -m; editors are never executed")?;
             ensure!(!message.trim().is_empty(), "empty tag message");
-            let obj = Object {
+            let mut obj = Object {
                 kind: Kind::Tag,
                 data: format!(
                     "object {target}\ntype {}\ntag {name}\ntagger {}\n\n{}\n",
@@ -78,6 +83,14 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                 )
                 .into_bytes(),
             };
+            if signed {
+                let path = cli
+                    .signing_key
+                    .as_deref()
+                    .context("signed tags require --signing-key or SAFE_GIT_SIGNING_KEY")?;
+                let key = crate::signing::key(cli, path)?;
+                crate::signing::sign_tag(&mut obj.data, &key)?;
+            }
             obj.children_for(repo.format)?;
             repo.write_object(&obj)?;
             obj.oid_for(repo.format)?

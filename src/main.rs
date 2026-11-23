@@ -1,11 +1,13 @@
 mod archive;
 mod binary_patch;
 mod bisect;
+mod bundle;
 mod checkout;
 mod clone;
 mod compat;
 mod config;
 mod extended_index;
+mod extras;
 mod files;
 mod history;
 mod host_keys;
@@ -17,6 +19,7 @@ mod mail;
 mod maintenance;
 mod mime;
 mod network;
+mod notes;
 mod object;
 mod output;
 mod pack;
@@ -26,9 +29,11 @@ mod patch;
 mod porcelain;
 mod protocol;
 mod push;
+mod range_diff;
 mod rebase_plan;
 mod remotes;
 mod repo;
+mod rerere;
 mod review;
 mod revision;
 mod search;
@@ -56,7 +61,7 @@ use transport::Auth;
 #[command(
     version = env!("SAFE_GIT_VERSION"),
     about = "Git operations without repository-directed execution",
-    after_help = "Everyday commands: status, add, switch, restore, diff, log, commit, stash.\nAdditional commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, branch, reset, reflog, checkout, rebase, cherry-pick, revert, tag, rev-list, describe,\narchive --format tar, show, blame, rm, mv, clean, remote, worktree, bisect, submodule, grep, apply, am, format-patch. Unsupported options fail closed."
+    after_help = "Everyday commands: status, add, switch, restore, diff, log, commit, stash.\nAdditional commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, branch, reset, reflog, checkout, rebase, cherry-pick, revert, tag, rev-list, describe,\narchive --format tar, show, blame, rm, mv, clean, remote, worktree, bisect, submodule, grep, apply, am, format-patch, bundle, notes, range-diff, rerere, verify-commit, verify-tag. Unsupported options fail closed."
 )]
 struct Cli {
     /// Repository or a directory within its working tree
@@ -84,6 +89,9 @@ struct Cli {
     /// Trusted host-key file (defaults to ~/.ssh/known_hosts)
     #[arg(long, global = true)]
     known_hosts: Option<PathBuf>,
+    /// Explicit trusted OpenSSH public key for verify-commit/verify-tag
+    #[arg(long, global = true, env = "SAFE_GIT_VERIFICATION_KEY")]
+    verification_key: Option<String>,
     /// Network operation deadline in seconds
     #[arg(long, default_value_t = 120, global = true, value_parser = clap::value_parser!(u64).range(1..=3600))]
     timeout: u64,
@@ -177,6 +185,8 @@ enum Command {
     },
     /// Merge a revision; conflicts can be continued or aborted
     Merge {
+        #[arg(long)]
+        allow_unrelated_histories: bool,
         #[arg(long)]
         ff_only: bool,
         #[arg(long)]
@@ -440,10 +450,17 @@ async fn run(cli: &Cli) -> Result<()> {
             } else if *ff_only {
                 merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;
             } else {
+                if let Some(old) = repo.read_ref("HEAD")? {
+                    ensure!(
+                        !revision::merge_bases(&mut store, old, incoming)?.is_empty(),
+                        "refusing to pull unrelated histories; fetch and explicitly merge them"
+                    );
+                }
                 sequence::merge(cli, &repo, &mut store, incoming, false, false)?;
             }
         }
         Command::Merge {
+            allow_unrelated_histories,
             reference,
             no_stat,
             ff_only,
@@ -472,6 +489,12 @@ async fn run(cli: &Cli) -> Result<()> {
                 None => revision::upstream(&repo)?,
             };
             let incoming = revision::commit(&repo, &mut store, &reference)?;
+            if !allow_unrelated_histories && let Some(head) = repo.read_ref("HEAD")? {
+                ensure!(
+                    !revision::merge_bases(&mut store, head, incoming)?.is_empty(),
+                    "refusing unrelated histories; use --allow-unrelated-histories"
+                );
+            }
             if *ff_only {
                 ensure!(!no_ff && !no_commit, "incompatible merge options");
                 merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;

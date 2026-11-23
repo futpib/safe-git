@@ -55,3 +55,76 @@ pub fn commit(
     repo.write_object(&signed)?;
     signed.oid_for(repo.format)
 }
+
+pub fn sign_tag(data: &mut Vec<u8>, key: &russh::keys::PrivateKey) -> Result<()> {
+    let signature = key
+        .sign("git", russh::keys::HashAlg::Sha512, data)?
+        .to_pem(russh::keys::ssh_key::LineEnding::LF)?;
+    ensure!(
+        data.len() + signature.len() <= crate::object::MAX_OBJECT,
+        "signed tag exceeds limit"
+    );
+    data.extend_from_slice(signature.as_bytes());
+    Ok(())
+}
+
+pub fn verify(
+    cli: &Cli,
+    repo: &Repo,
+    store: &mut Store<'_>,
+    command: &str,
+    args: &[String],
+) -> Result<()> {
+    let path = cli.verification_key.as_deref().context("provide --verification-key or SAFE_GIT_VERIFICATION_KEY; repository trust settings are ignored")?;
+    let bytes = crate::mail::read_input(cli, path)?;
+    let key = russh::keys::PublicKey::from_openssh(std::str::from_utf8(&bytes)?)?;
+    ensure!(!args.is_empty(), "provide objects to verify");
+    for arg in args {
+        ensure!(!arg.starts_with('-'), "unsupported verification option");
+        let id = crate::revision::resolve(repo, store, arg)?;
+        let obj = store.get(id)?;
+        let (payload, pem) = if command == "verify-tag" {
+            ensure!(obj.kind == Kind::Tag, "expected annotated tag");
+            let marker = b"-----BEGIN SSH SIGNATURE-----\n";
+            let at = obj
+                .data
+                .windows(marker.len())
+                .position(|w| w == marker)
+                .context("no SSH tag signature")?;
+            (obj.data[..at].to_vec(), obj.data[at..].to_vec())
+        } else {
+            ensure!(obj.kind == Kind::Commit, "expected commit");
+            let mut payload = Vec::new();
+            let mut pem = Vec::new();
+            let mut signature = false;
+            let mut headers = true;
+            let field = if repo.format == crate::object::Format::Sha256 {
+                b"gpgsig-sha256 ".as_slice()
+            } else {
+                b"gpgsig ".as_slice()
+            };
+            for line in obj.data.split_inclusive(|b| *b == b'\n') {
+                if headers && let Some(first) = line.strip_prefix(field) {
+                    ensure!(pem.is_empty(), "duplicate commit signature");
+                    signature = true;
+                    pem.extend_from_slice(first);
+                } else if headers && signature && line.starts_with(b" ") {
+                    pem.extend_from_slice(&line[1..]);
+                } else {
+                    signature = false;
+                    if line == b"\n" {
+                        headers = false;
+                    }
+                    payload.extend_from_slice(line);
+                }
+            }
+            ensure!(!pem.is_empty(), "no SSH commit signature");
+            (payload, pem)
+        };
+        let signature = russh::keys::ssh_key::SshSig::from_pem(&pem)?;
+        key.verify("git", &payload, &signature)
+            .context("signature does not match the caller's trusted key")?;
+        println!("Good SSH signature for {id}");
+    }
+    Ok(())
+}

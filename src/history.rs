@@ -122,6 +122,9 @@ pub fn previous(repo: &Repo) -> Result<String> {
     bail!("no previous checkout recorded")
 }
 pub fn reflog(repo: &Repo, args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|a| a == "expire") {
+        return crate::maintenance::expire_reflogs(repo, &args[1..]);
+    }
     let mut reference = "HEAD";
     let mut count = 10000;
     for arg in args {

@@ -8,6 +8,8 @@ mod closure;
 mod completion;
 #[path = "suites/extended.rs"]
 mod extended;
+#[path = "suites/final_gaps.rs"]
+mod final_gaps;
 #[path = "suites/gaps.rs"]
 mod gaps;
 #[path = "suites/http_packages.rs"]
@@ -43,6 +45,38 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("final_gaps_topology_recovery", || {
+                final_gaps::topology_recovery();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("final_gaps_gc_protection", || {
+                final_gaps::gc_protection();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("final_gaps_topology", || {
+                final_gaps::topology();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("final_gaps_data_commands", || {
+                final_gaps::data_commands();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("final_gaps_signatures", || {
+                final_gaps::signatures();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("final_gaps_worktrees", || {
+                final_gaps::worktrees();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("final_gaps_rerere_gc", || {
+                final_gaps::rerere_gc();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("final_gaps_merges", || {
+                final_gaps::merges();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("closure_sha256_ssh_native", || {
                 closure::sha256_ssh_native();
                 Ok(())
