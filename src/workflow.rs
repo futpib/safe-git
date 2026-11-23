@@ -35,7 +35,7 @@ pub fn run(
     }
 }
 
-fn paths(args: &[String], prefix: &std::path::Path) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn paths(args: &[String], prefix: &std::path::Path) -> Result<Vec<Vec<u8>>> {
     args.iter()
         .map(|arg| {
             let mut value = arg.as_str();
@@ -87,7 +87,7 @@ fn paths(args: &[String], prefix: &std::path::Path) -> Result<Vec<Vec<u8>>> {
         })
         .collect()
 }
-fn selected(path: &[u8], specs: &[Vec<u8>]) -> bool {
+pub(crate) fn selected(path: &[u8], specs: &[Vec<u8>]) -> bool {
     specs.iter().any(|s| {
         s.is_empty()
             || path == s
@@ -232,6 +232,7 @@ struct Scan<'a> {
     visited: usize,
     budget: usize,
     files: BTreeSet<Vec<u8>>,
+    directories: BTreeSet<Vec<u8>>,
 }
 impl Scan<'_> {
     fn walk(
@@ -285,7 +286,10 @@ impl Scan<'_> {
                     Ok(_) => {
                         self.files.insert(path);
                     } // Never descend into another repository.
-                    Err(rustix::io::Errno::NOENT) => self.walk(&child, &path, rules, depth + 1)?,
+                    Err(rustix::io::Errno::NOENT) => {
+                        self.directories.insert(path.clone());
+                        self.walk(&child, &path, rules, depth + 1)?;
+                    }
                     Err(e) => return Err(e.into()),
                 }
             } else {
@@ -302,6 +306,15 @@ pub(crate) fn untracked(
     specs: &[Vec<u8>],
     force: bool,
 ) -> Result<BTreeSet<Vec<u8>>> {
+    Ok(scan_untracked(repo, tracked, specs, force)?.0)
+}
+type Paths = BTreeSet<Vec<u8>>;
+pub(crate) fn scan_untracked(
+    repo: &Repo,
+    tracked: &Entries,
+    specs: &[Vec<u8>],
+    force: bool,
+) -> Result<(Paths, Paths)> {
     let root = repo.worktree.as_ref().context("requires a working tree")?;
     let mut rules = Vec::new();
     if !force && let Some(bytes) = repo.read("info/exclude", 1024 * 1024)? {
@@ -315,11 +328,18 @@ pub(crate) fn untracked(
         visited: 0,
         budget: 64 * 1024 * 1024,
         files: BTreeSet::new(),
+        directories: BTreeSet::new(),
     };
     scan.walk(root, b"", &mut rules, 0)?;
     scan.files
         .retain(|p| !tracked.contains_key(p) && selected(p, specs));
-    Ok(scan.files)
+    scan.directories.retain(|p| {
+        selected(p, specs)
+            && !tracked
+                .keys()
+                .any(|t| t == p || t.starts_with(&[p.as_slice(), b"/"].concat()))
+    });
+    Ok((scan.files, scan.directories))
 }
 
 fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
@@ -383,6 +403,13 @@ fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
     }
     check_paths(&specs, &targets.keys().cloned().collect())?;
     let mut actual = checkout::snapshot(repo, &targets)?;
+    for (path, entry) in &mut actual {
+        if entry.mode == 0o160000
+            && let Some(id) = crate::submodule::head(repo, path)?
+        {
+            entry.oid = id;
+        }
+    }
     if patch {
         actual = crate::patch::select(repo, &mut Store::new(repo), &targets, &actual)?;
     }
@@ -626,8 +653,12 @@ fn switch(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Res
         None
     };
     if let Some(source) = &track_source {
-        let binding = crate::trust::require(repo)?;
         let short = source.strip_prefix("refs/remotes/").unwrap_or(source);
+        let remote = short
+            .split_once('/')
+            .context("tracking requires REMOTE/BRANCH")?
+            .0;
+        let binding = crate::trust::named(repo, remote)?.context("remote is not registered")?;
         ensure!(
             short.starts_with(&format!("{}/", binding.remote)),
             "tracking requires a host-registered remote"
@@ -1066,7 +1097,7 @@ fn change(a: Option<Entry>, b: Option<Entry>) -> char {
         }
     }
 }
-fn quote_path(path: &[u8]) -> String {
+pub(crate) fn quote_path(path: &[u8]) -> String {
     if path
         .iter()
         .all(|b| (33..127).contains(b) && !b"\"\\".contains(b))

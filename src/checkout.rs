@@ -42,7 +42,7 @@ impl<'a> Work<'a> {
         );
         Ok(Self { root, device })
     }
-    fn parent(&self, path: &[u8]) -> Result<(File, Vec<u8>)> {
+    pub(crate) fn parent(&self, path: &[u8]) -> Result<(File, Vec<u8>)> {
         index::path(path)?;
         let mut components: Vec<_> = path.split(|b| *b == b'/').collect();
         let name = components.pop().context("empty path")?.to_vec();
@@ -255,7 +255,8 @@ impl Journal {
             }
         }
         ensure!(
-            (self.head == "HEAD" || self.head.starts_with("refs/heads/")) && self.new != Oid::ZERO,
+            (self.head == "HEAD" || self.head.starts_with("refs/heads/"))
+                && (self.new != Oid::ZERO || (self.old.is_none() && self.head_after.is_none())),
             "invalid journal branch"
         );
         let mut names = BTreeSet::new();
@@ -326,7 +327,7 @@ pub fn edit(repo: &Repo, store: &mut Store<'_>, edit: Edit) -> Result<()> {
         store,
         Update {
             reference: &head,
-            old: Some(tip),
+            old: (tip != Oid::ZERO).then_some(tip),
             new: tip,
             after: edit.after.clone(),
             force: false,
@@ -574,7 +575,11 @@ fn apply_inner(
         );
         index_lock.file.write_all(&new_index)?;
         index_lock.commit("index")?;
-        ref_update.commit(new)?;
+        if new != Oid::ZERO {
+            ref_update.commit(new)?;
+        } else {
+            drop(ref_update);
+        }
         // Equal-tip updates (reset HEAD and a review merge) need their own commit marker.
         repo.atomic(&format!("{TXN}/committed"), b"done\n")?;
         finish_head(repo, &journal, head_lock.as_mut())?;
@@ -757,8 +762,8 @@ pub fn recover(repo: &Repo) -> Result<()> {
         None
     };
     let mut index_lock = Pending::new(repo.root.try_clone()?, "index.lock".into())?;
-    if tip == Some(journal.new)
-        && (journal.old != Some(journal.new)
+    if ((journal.new == Oid::ZERO && tip.is_none()) || tip == Some(journal.new))
+        && ((journal.new != Oid::ZERO && journal.old != Some(journal.new))
             || repo.read(&format!("{TXN}/committed"), 16)?.as_deref() == Some(b"done\n"))
     {
         // The ref was committed last: all file/index changes finished. Leave any

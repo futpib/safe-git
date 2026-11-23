@@ -7,17 +7,15 @@ use crate::{
     trust,
 };
 use anyhow::{Context, Result, ensure};
-use rustix::fs::{self, CWD, RenameFlags};
-use std::{
-    fs::{File, Metadata},
-    os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
-};
+use rustix::fs::{self, CWD, Mode, OFlags, RenameFlags};
+use std::{ffi::OsString, fs::File, os::fd::AsRawFd, path::Path};
 
 struct Destination {
-    path: PathBuf,
-    existing: Option<Metadata>,
+    // TempDir uses /proc/self/fd/PARENT; clean it before closing that descriptor.
     staging: tempfile::TempDir,
+    parent: File,
+    name: OsString,
+    existing: Option<(u64, u64)>,
 }
 
 impl Destination {
@@ -31,64 +29,75 @@ impl Destination {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let parent = parent
-            .canonicalize()
-            .context("open clone destination parent")?;
-        let path = parent.join(name);
-        let existing = match std::fs::symlink_metadata(&path) {
-            Ok(meta) => {
+        let parent = File::from(fs::open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let existing = match fs::statat(&parent, name, fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
                 ensure!(
-                    meta.is_dir(),
-                    "clone destination must be a real directory, not a file or symlink"
+                    stat.st_mode & 0o170000 == 0o40000,
+                    "clone destination must be a real directory"
                 );
-                ensure!(
-                    std::fs::read_dir(&path)?.next().is_none(),
-                    "clone destination is not empty"
-                );
-                Some(meta)
+                let child = File::from(fs::openat(
+                    &parent,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?);
+                for entry in fs::Dir::read_from(&child)? {
+                    ensure!(
+                        matches!(entry?.file_name().to_bytes(), b"." | b".."),
+                        "clone destination is not empty"
+                    );
+                }
+                Some((stat.st_dev, stat.st_ino))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(rustix::io::Errno::NOENT) => None,
             Err(e) => return Err(e.into()),
         };
         let staging = tempfile::Builder::new()
             .prefix(".safe-git-clone-")
-            .tempdir_in(parent)?;
+            .tempdir_in(format!("/proc/self/fd/{}", parent.as_raw_fd()))?;
         Ok(Self {
-            path,
+            parent,
+            name: name.into(),
             existing,
             staging,
         })
     }
+
     fn publish(self) -> Result<()> {
         if let Some(original) = self.existing {
-            let current = std::fs::symlink_metadata(&self.path)?;
+            let current = fs::statat(&self.parent, &self.name, fs::AtFlags::SYMLINK_NOFOLLOW)?;
             ensure!(
-                current.is_dir()
-                    && current.dev() == original.dev()
-                    && current.ino() == original.ino(),
+                current.st_mode & 0o170000 == 0o40000
+                    && (current.st_dev, current.st_ino) == original,
                 "clone destination changed"
             );
             // rename can replace an empty directory, but never a populated
             // directory, regular file, or symlink with our directory.
-            fs::renameat(CWD, self.staging.path(), CWD, &self.path)?;
+            fs::renameat(CWD, self.staging.path(), &self.parent, &self.name)?;
         } else {
             fs::renameat_with(
                 CWD,
                 self.staging.path(),
-                CWD,
-                &self.path,
+                &self.parent,
+                &self.name,
                 RenameFlags::NOREPLACE,
             )
             .context("publish clone without replacing an existing destination")?;
         }
         // The staging path was moved. Disarm its destructor before returning.
         let _ = self.staging.keep();
-        File::open(self.path.parent().context("clone parent")?)?.sync_all()?;
+        self.parent.sync_all()?;
         Ok(())
     }
 }
 
 pub struct Options<'a> {
+    pub depth: Option<u32>,
     pub branch: Option<&'a str>,
     pub remote: &'a str,
     pub single: bool,
@@ -143,9 +152,10 @@ pub async fn run(
         !selected.keys().any(|n| n.starts_with("refs/replace/")),
         "replacement refs are unsupported"
     );
-    let objects = network::fetch(&url, auth, &selected, &[]).await?;
+    let fetched = network::fetch_depth(&url, auth, &selected, &[], options.depth).await?;
     let mut store = Store::new(&repo);
-    store.add(objects)?;
+    store.shallow = fetched.shallow;
+    store.add(fetched.objects)?;
     for (name, id) in &selected {
         if name.starts_with("refs/heads/") {
             store.get(*id)?.commit()?;
@@ -156,6 +166,14 @@ pub async fn run(
         &selected.values().copied().collect::<Vec<_>>(),
         &std::collections::HashSet::new(),
     )?;
+    ensure!(
+        store.shallow.iter().all(|id| ids.contains(id)),
+        "unreachable shallow boundary"
+    );
+    for id in store.shallow.clone() {
+        store.get(id)?.commit()?;
+    }
+    crate::shallow::save(&repo, &store.shallow)?;
     for id in ids {
         repo.write_object(store.get(id)?.as_ref())?;
     }
@@ -213,6 +231,21 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn publication_uses_the_opened_parent_after_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let moved = root.path().join("moved");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let stage = Destination::new(&parent.join("repo")).unwrap();
+        std::fs::rename(&parent, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+        stage.publish().unwrap();
+        assert!(moved.join("repo").is_dir());
+        assert!(!outside.join("repo").exists());
+    }
     #[test]
     fn publication_never_clobbers_files_or_populated_directories() {
         let root = tempfile::tempdir().unwrap();

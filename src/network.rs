@@ -214,11 +214,37 @@ pub async fn fetch(
     refs: &HashMap<String, Oid>,
     haves: &[Oid],
 ) -> Result<Objects> {
+    Ok(fetch_depth(url, auth, refs, haves, None).await?.objects)
+}
+pub struct Fetched {
+    pub objects: Objects,
+    pub shallow: HashSet<Oid>,
+}
+pub async fn fetch_depth(
+    url: &str,
+    auth: &Auth,
+    refs: &HashMap<String, Oid>,
+    haves: &[Oid],
+    depth: Option<u32>,
+) -> Result<Fetched> {
+    let haves = if depth.is_some() { &[][..] } else { haves };
     if refs.is_empty() {
-        return Ok(Objects::new());
+        return Ok(Fetched {
+            objects: Objects::new(),
+            shallow: HashSet::new(),
+        });
     }
     match endpoint(url)? {
-        Endpoint::Ssh(remote) => protocol::fetch_many(&remote, auth, refs, haves).await,
+        Endpoint::Ssh(remote) => {
+            if let Some(depth) = depth {
+                protocol::fetch_depth(&remote, auth, refs, depth).await
+            } else {
+                Ok(Fetched {
+                    objects: protocol::fetch_many(&remote, auth, refs, haves).await?,
+                    shallow: HashSet::new(),
+                })
+            }
+        }
         Endpoint::Http(base) => {
             let client = client()?;
             let ad = http_ad(&client, &base).await?;
@@ -229,7 +255,8 @@ pub async fn fetch(
                 );
             }
             let tips: HashSet<_> = refs.values().copied().collect();
-            let request = protocol::request(&ad, &tips.into_iter().collect::<Vec<_>>(), haves)?;
+            let request =
+                protocol::request_depth(&ad, &tips.into_iter().collect::<Vec<_>>(), haves, depth)?;
             let response = http_auth(client.post(service_url(&base, "git-upload-pack")?), &base)?
                 .header(
                     reqwest::header::CONTENT_TYPE,
@@ -244,11 +271,20 @@ pub async fn fetch(
                 .await?;
             let data = body(response, "application/x-git-upload-pack-result", MAX_PACK).await?;
             let mut bytes = data.as_slice();
+            let mut shallow = HashSet::new();
+            if depth.is_some() {
+                while let Some(line) = packet(&mut bytes)? {
+                    protocol::shallow_line(line, &mut shallow)?;
+                }
+            }
             protocol::check_ack(
                 packet(&mut bytes)?.context("missing negotiation response")?,
                 haves,
             )?;
-            protocol::decode_pack(bytes, haves)
+            Ok(Fetched {
+                objects: protocol::decode_pack(bytes, haves)?,
+                shallow,
+            })
         }
         Endpoint::Git(base) => {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -261,10 +297,11 @@ pub async fn fetch(
             }
             let tips: HashSet<_> = refs.values().copied().collect();
             socket
-                .write_all(&protocol::request(
+                .write_all(&protocol::request_depth(
                     &ad,
                     &tips.into_iter().collect::<Vec<_>>(),
                     haves,
+                    depth,
                 )?)
                 .await?;
             socket.shutdown().await?;
@@ -275,11 +312,20 @@ pub async fn fetch(
                 .await?;
             ensure!(data.len() <= MAX_PACK, "native Git response exceeds limit");
             let mut bytes = data.as_slice();
+            let mut shallow = HashSet::new();
+            if depth.is_some() {
+                while let Some(line) = packet(&mut bytes)? {
+                    protocol::shallow_line(line, &mut shallow)?;
+                }
+            }
             protocol::check_ack(
                 packet(&mut bytes)?.context("missing negotiation response")?,
                 haves,
             )?;
-            protocol::decode_pack(bytes, haves)
+            Ok(Fetched {
+                objects: protocol::decode_pack(bytes, haves)?,
+                shallow,
+            })
         }
         Endpoint::Local(path) => {
             let repo = Repo::open(&path)?;
@@ -292,6 +338,23 @@ pub async fn fetch(
                     ad.refs.get(name) == Some(id),
                     "local source ref changed while fetching; retry"
                 );
+            }
+            let mut shallow = store.shallow.clone();
+            if let Some(depth) = depth {
+                let tips: Vec<_> = refs
+                    .values()
+                    .map(|id| crate::revision::peel(&mut store, *id))
+                    .collect::<Result<_>>()?;
+                let commits: Vec<_> = tips
+                    .into_iter()
+                    .filter(|id| {
+                        store
+                            .get(*id)
+                            .is_ok_and(|o| o.kind == crate::object::Kind::Commit)
+                    })
+                    .collect();
+                shallow.extend(crate::shallow::boundary(&mut store, &commits, depth)?);
+                store.shallow = shallow.clone();
             }
             let ids = crate::object::reachable_many_since(
                 &mut store,
@@ -307,7 +370,7 @@ pub async fn fetch(
                 );
                 objects.insert(id, obj);
             }
-            Ok(objects)
+            Ok(Fetched { objects, shallow })
         }
     }
 }

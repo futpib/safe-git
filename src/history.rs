@@ -154,10 +154,14 @@ pub fn reflog(repo: &Repo, args: &[String]) -> Result<()> {
     Ok(())
 }
 pub fn track(repo: &Repo, local: &str, remote_ref: &str) -> Result<()> {
-    let mut binding = trust::require(repo)?;
     let short = remote_ref
         .strip_prefix("refs/remotes/")
         .unwrap_or(remote_ref);
+    let remote = short
+        .split_once('/')
+        .context("tracking requires REMOTE/BRANCH")?
+        .0;
+    let mut binding = trust::named(repo, remote)?.context("remote is not registered")?;
     let target = short
         .strip_prefix(&format!("{}/", binding.remote))
         .context("tracking requires a branch of the host-registered remote")?;
@@ -246,6 +250,7 @@ pub fn branch(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) ->
             for name in names {
                 let name = format!("refs/heads/{}", crate::repo::branch(name)?);
                 ensure!(name != head, "cannot delete the current branch");
+                crate::linked::available(repo, &name)?;
                 let old = repo.read_ref(&name)?.context("branch does not exist")?;
                 ensure!(
                     force || ancestor(store, old, tip)?,
@@ -281,6 +286,8 @@ pub fn branch(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) ->
             let old_name = format!("refs/heads/{from}");
             let new_name = format!("refs/heads/{to}");
             ensure!(new_name != head, "cannot overwrite the current branch");
+            crate::linked::available(repo, &old_name)?;
+            crate::linked::available(repo, &new_name)?;
             let old = repo.read_ref(&old_name)?.context("branch does not exist")?;
             let existing = repo.read_ref(&new_name)?;
             ensure!(force || existing.is_none(), "destination branch exists");
@@ -313,6 +320,7 @@ pub fn branch(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) ->
                 "branch accepts name and optional start point"
             );
             let name = format!("refs/heads/{}", crate::repo::branch(names[0])?);
+            crate::linked::available(repo, &name)?;
             let old = repo.read_ref(&name)?;
             ensure!(
                 old.is_none() || (force && name != head),

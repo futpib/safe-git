@@ -86,8 +86,11 @@ pub fn tracking(remote: &str, name: &str) -> Result<String> {
 /// No repository symlink is followed, even during component traversal.
 pub struct Repo {
     pub(crate) root: File,
+    pub(crate) common: Option<File>,
+    pub(crate) shallow: std::collections::HashSet<Oid>,
     pub(crate) worktree: Option<File>,
     _lock: File,
+    _common_lock: Option<File>,
 }
 impl Repo {
     pub fn init(path: &Path, initial: &str) -> Result<()> {
@@ -128,7 +131,7 @@ impl Repo {
         repo.atomic("HEAD", format!("ref: refs/heads/{initial}\n").as_bytes())?;
         Ok(())
     }
-    fn lock(root: File) -> Result<Self> {
+    pub(crate) fn lock(root: File) -> Result<Self> {
         let fd = fs::openat(
             &root,
             ".safe-git.lock",
@@ -145,26 +148,41 @@ impl Repo {
             .context("repository is locked by another safe-git operation")?;
         Ok(Self {
             root,
+            common: None,
+            shallow: Default::default(),
             worktree: None,
             _lock: lock,
+            _common_lock: None,
         })
     }
     pub fn open(path: &Path) -> Result<Self> {
         let directory =
             File::from(fs::open(path, DIR, Mode::empty()).context("open repository directory")?);
-        let (metadata, worktree) = match fs::openat(&directory, ".git", DIR, Mode::empty()) {
-            Ok(fd) => (File::from(fd), Some(directory)),
-            Err(Errno::NOENT) => (directory, None),
-            Err(e) => return Err(e).context(
-                ".git must be a real directory; linked worktrees and gitdir files are unsupported",
-            ),
+        let mut repo = match fs::openat(&directory, ".git", DIR, Mode::empty()) {
+            Ok(fd) => {
+                let mut repo = Self::lock(File::from(fd))?;
+                repo.worktree = Some(directory);
+                repo
+            }
+            Err(Errno::NOENT) => Self::lock(directory)?,
+            Err(Errno::NOTDIR) => {
+                let link = crate::linked::lookup(&directory)?;
+                let common = Self::lock(link.common.open()?)?;
+                let mut repo = Self::lock(link.metadata.open()?)?;
+                repo.common = Some(common.root);
+                repo._common_lock = Some(common._lock);
+                repo.worktree = Some(directory);
+                repo
+            }
+            Err(e) => return Err(e).context("unsafe .git entry"),
         };
-        let mut repo = Self::lock(metadata)?;
-        repo.worktree = worktree;
+        if repo.common.is_none() {
+            ensure!(
+                !repo.exists("commondir")? && !repo.exists("gitdir")?,
+                "unregistered linked repository metadata"
+            );
+        }
         for unsupported in [
-            "commondir",
-            "gitdir",
-            "shallow",
             "objects/info/alternates",
             "objects/info/http-alternates",
             "info/grafts",
@@ -180,9 +198,10 @@ impl Repo {
             .context("repository has no config")?;
         let bare = validate_config(&config)?;
         ensure!(
-            bare == repo.worktree.is_none(),
+            (repo.common.is_some() && repo.worktree.is_some()) || bare == repo.worktree.is_none(),
             "use the working-tree root for a non-bare repository"
         );
+        repo.shallow = crate::shallow::read(&repo)?;
         repo.head()?;
         // Verify these directory components even before any object/ref reads.
         repo.parent("objects/.check", false)?;
@@ -198,7 +217,20 @@ impl Repo {
             "invalid internal path"
         );
         let name = parts.pop().context("empty path")?.to_owned();
-        let mut dir = self.root.try_clone()?;
+        let shared = path == "config"
+            || path == "packed-refs"
+            || path == "packed-refs.lock"
+            || path == "shallow"
+            || path.starts_with("objects/")
+            || path.starts_with("refs/")
+            || path.starts_with("logs/refs/")
+            || path.starts_with("worktrees/");
+        let mut dir = if shared {
+            self.common.as_ref().unwrap_or(&self.root)
+        } else {
+            &self.root
+        }
+        .try_clone()?;
         for part in parts {
             if create {
                 match fs::mkdirat(&dir, part, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
@@ -373,7 +405,10 @@ impl Repo {
     }
     pub fn delete_ref(&self, name: &str, expected: Oid) -> Result<()> {
         let _lock = self.prepare_ref(name, Some(expected))?;
-        let mut lock = Pending::new(self.root.try_clone()?, "packed-refs.lock".into())?;
+        let mut lock = Pending::new(
+            self.common.as_ref().unwrap_or(&self.root).try_clone()?,
+            "packed-refs.lock".into(),
+        )?;
         let mut packed = self.packed_refs()?;
         if packed.remove(name).is_some() {
             let mut out = String::new();
@@ -571,6 +606,7 @@ pub struct Store<'a> {
     incoming_bytes: usize,
     packs: Vec<Packed>,
     packs_loaded: bool,
+    pub(crate) shallow: std::collections::HashSet<Oid>,
 }
 #[derive(Debug)]
 pub struct MissingObject(pub Oid);
@@ -594,6 +630,7 @@ impl<'a> Store<'a> {
             incoming_bytes: 0,
             packs: Vec::new(),
             packs_loaded: false,
+            shallow: repo.shallow.clone(),
         }
     }
     pub fn add(&mut self, objects: Objects) -> Result<()> {
@@ -757,6 +794,17 @@ impl Store<'_> {
     }
 }
 impl ReadObjects for Store<'_> {
+    fn shallow(&self, id: Oid) -> bool {
+        self.shallow.contains(&id)
+    }
+    fn parents(&mut self, id: Oid) -> Result<Vec<Oid>> {
+        let parents = self.get(id)?.commit()?.1;
+        Ok(if self.shallow.contains(&id) {
+            Vec::new()
+        } else {
+            parents
+        })
+    }
     fn get(&mut self, oid: Oid) -> Result<Arc<Object>> {
         self.get_inner(oid, 0, &mut 0)
     }

@@ -1,38 +1,40 @@
 # Git compatibility
 
-The everyday workflow includes working-tree/bare `init`, clone/fetch/pull/push,
-branch listing/creation/rename/deletion, switch (including `-` and tracking),
-status, add, restore, diff, log, commit/amend, reset, reflog, and stash.
-Add/restore accept relative paths, wildcard pathspecs, and built-in `-p` hunk
-selection. Status includes renames, ahead/behind counts, and porcelain v1/v2.
-Stash supports untracked/ignored files, older entries, show/apply/pop/drop/clear.
+Everyday editing includes init, clone/fetch/pull/push, branches, switch, status,
+add/restore (including selected hunks), rm/mv/clean, commit/amend, reset, reflog,
+and stash. Directory moves preserve untracked files and unstaged edits; clean
+requires an explicit force request or dry run.
 
-Merge, cherry-pick, revert, and rebase support conflicts: edit the files, `add`
-them, then use the operation's `--continue`, `--skip` (where applicable), or
-`--abort`. Conflicts use Git index stages. Interactive rebase reads a plan from
-stdin: `pick`, `reword`, `edit`, `squash`, `fixup`, or `drop` followed by a commit
-and optional message; end with `done`. No editor or `exec` instruction runs.
-Rebase flattens local merges. Interrupted checkout updates use `recover`.
+Inspection includes show, blame, path-filtered log, --all/--graph/--decorate,
+three-dot diffs, and lightweight/annotated tag creation, listing, and deletion.
+Merge, cherry-pick, revert, and rebase support conflicts and continue/abort.
+Pull supports --rebase; rebase supports --onto and --autosquash. Interactive
+rebase reads pick/reword/edit/squash/fixup/drop plans from stdin; it never opens
+an editor or executes a plan command. Rebase flattens local merges. Bisect
+supports start/good/bad/skip/log/reset, without executing test commands.
 
-Fetch supports SSH, HTTP(S), native `git://`, and local objects. Push supports
-SSH and HTTP(S), branch/tag refspecs, `--tags`, deletion, explicit `--force`, and
-`--force-with-lease[=REF:OID]`. Without an explicit force request, existing
-branches must fast-forward and existing tags cannot be replaced. An optional
-caller-provided `SAFE_GIT_HTTP_TOKEN` is sent as a bearer token only over HTTPS.
-Redirects and credential helpers are never followed.
+Clone --depth negotiates shallow history; fetch --unshallow restores it.
+Fetch supports SSH, HTTP(S), native git://, and local objects. Push supports
+SSH/HTTP(S), branches/tags, deletion, explicit force, and force-with-lease.
+Caller-provided SAFE_GIT_HTTP_TOKEN is sent only over HTTPS. Redirects and
+credential helpers are never followed.
 
-Clone registers the endpoint outside the repository in trusted host state.
-`push -u origin BRANCH` records its upstream there; subsequent push/pull use
-that mapping. Existing Git-created repositories require an explicit URL or
-registration with `safe-git config remote.origin.url URL`. Repository remote
-URLs, upstream settings, and URL rewrites cannot redirect network operations.
+Remote add/set-url/get-url/rename/remove/show/update and fetch --all use
+host-owned registrations. Clone and push -u remember endpoints/upstreams there.
+Existing repositories need an explicit URL or registration with remote add or
+config remote.NAME.url. Repository URLs and rewrites never select endpoints.
 
-Paru's `--git /path/to/safe-git` selects this client; makepkg selects `git`
-through `PATH`. Their clone/fetch/review/rebase, mirror/prune/checkout/archive,
-and common `pkgver()` commands are covered by integration tests.
+Worktree add/list/remove/prune uses shared objects and refs, with host records
+binding linked directories to their locations and filesystem identities.
+Unregistered gitdir/commondir pointers are refused. Submodule add accepts a
+caller URL; existing gitlinks need `submodule init --url URL -- PATH` before
+`submodule update`. Each submodule endpoint is registered individually;
+.gitmodules URLs and update commands are never followed. Status and deinit are
+supported; deinit retains local repositories in .git/safe-git-submodules.
 
-Hooks, filters, aliases, signers, includes, external diffs, merge drivers,
-submodule commands, and executable sequencer instructions remain unsupported.
-Ignore files are bounded inert patterns. Unsafe paths, escaping symlinks,
-external hard links, unsupported repository formats, and file/directory
-transitions are rejected. Unknown options fail rather than invoking Git.
+Paru/makepkg workflows remain covered. Hooks, filters, aliases, signers,
+includes, external diffs, merge drivers, and executable sequencer instructions
+remain unsupported. Filesystem access rejects escaping symlinks, external hard
+links, unsafe paths, and unsupported formats. Parsing/traversal stays bounded;
+unknown commands/options fail without invoking Git. Interrupted file/index
+updates use recover.

@@ -208,7 +208,16 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             "add",
             "switch",
             "restore",
-            "stash"
+            "stash",
+            "show",
+            "blame",
+            "rm",
+            "mv",
+            "clean",
+            "remote",
+            "worktree",
+            "bisect",
+            "submodule"
         ]
         .contains(&name),
         "unsupported Git command {name}; no external fallback is implemented"
@@ -226,6 +235,12 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
     }
     let mut store = Store::new(&repo);
     match name {
+        "show" | "blame" => crate::inspect::run(cli, &repo, &mut store, name, items),
+        "rm" | "mv" | "clean" => crate::files::run(cli, &repo, &mut store, name, items),
+        "remote" => crate::remotes::run(cli, &repo, &mut store, items).await,
+        "worktree" => crate::linked::run(cli, &repo, &mut store, items),
+        "bisect" => crate::bisect::run(cli, &repo, &mut store, items),
+        "submodule" => crate::submodule::run(cli, &repo, &mut store, items).await,
         "branch" => crate::history::branch(cli, &repo, &mut store, items),
         "reflog" => crate::history::reflog(&repo, items),
         "status" | "add" | "switch" | "restore" | "stash" => {
@@ -501,7 +516,8 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             )
         }
         "diff" => diff(&repo, &mut store, items),
-        "log" | "rev-list" => history(&repo, &mut store, items, name == "rev-list"),
+        "log" | "rev-list" => history(&repo, &mut store, items, name == "rev-list", &cli.prefix),
+        "tag" if crate::tags::is_mutation(items) => crate::tags::run(cli, &repo, &mut store, items),
         "tag" => {
             let pos = args(items, &["-l", "--list", "--format="])?;
             ensure!(
@@ -579,8 +595,13 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
         _ => unreachable!(),
     }
 }
-pub async fn fetch_all(cli: &Cli, repo: &Repo, store: &mut Store<'_>, prune: bool) -> Result<()> {
-    let binding = trust::require(repo)?;
+pub async fn fetch_binding(
+    cli: &Cli,
+    repo: &Repo,
+    store: &mut Store<'_>,
+    prune: bool,
+    binding: &trust::Binding,
+) -> Result<()> {
     ensure!(
         !binding.bare || repo.worktree.is_none(),
         "registered repository mode changed"
@@ -606,7 +627,7 @@ pub async fn fetch_all(cli: &Cli, repo: &Repo, store: &mut Store<'_>, prune: boo
         "replacement refs are unsupported"
     );
     let existing = repo.refs()?;
-    let haves: Vec<_> = existing
+    let mut haves: Vec<_> = existing
         .iter()
         .filter(|(n, _)| {
             n.starts_with("refs/heads/") || n.starts_with("refs/remotes/") && !n.ends_with("/HEAD")
@@ -618,6 +639,9 @@ pub async fn fetch_all(cli: &Cli, repo: &Repo, store: &mut Store<'_>, prune: boo
         .collect();
     for id in &haves {
         store.get(*id)?.commit()?;
+    }
+    if !store.shallow.is_empty() {
+        haves.clear();
     }
     let boundary = crate::object::commits(store, &haves)?;
     store.add(network::fetch(&binding.url, &cli.auth()?, &selected, &haves).await?)?;
@@ -724,9 +748,13 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
         }
     } else if pos.len() == 1 && pos[0].contains("..") {
         let (a, b) = pos[0].split_once("..").unwrap();
-        ensure!(!b.starts_with('.'), "three-dot diffs are unsupported");
-        let a = revision::resolve(repo, store, if a.is_empty() { "HEAD" } else { a })?;
+        let symmetric = b.starts_with('.');
+        let b = b.strip_prefix('.').unwrap_or(b);
+        let mut a = revision::resolve(repo, store, if a.is_empty() { "HEAD" } else { a })?;
         let b = revision::resolve(repo, store, if b.is_empty() { "HEAD" } else { b })?;
+        if symmetric {
+            a = revision::merge_base(store, a, b)?;
+        }
         (porcelain::tree(store, a)?, porcelain::tree(store, b)?)
     } else if pos.len() == 2 {
         let a = revision::resolve(repo, store, pos[0])?;
@@ -892,10 +920,24 @@ fn timezone(zone: &str) -> Result<time::UtcOffset> {
         },
     )?)
 }
-fn history(repo: &Repo, store: &mut Store<'_>, items: &[String], list: bool) -> Result<()> {
+pub(crate) fn history(
+    repo: &Repo,
+    store: &mut Store<'_>,
+    items: &[String],
+    list: bool,
+    prefix: &std::path::Path,
+) -> Result<()> {
     let mut normalized = Vec::new();
     let mut input = items.iter();
+    let mut paths = false;
     while let Some(item) = input.next() {
+        if item == "--" {
+            paths = true;
+        }
+        if paths {
+            normalized.push(item.clone());
+            continue;
+        }
         if item == "-n" || item == "--max-count" {
             let count = input.next().context("missing history count")?;
             count.parse::<usize>().context("invalid history count")?;
@@ -910,8 +952,9 @@ fn history(repo: &Repo, store: &mut Store<'_>, items: &[String], list: bool) -> 
         }
     }
     let items = &normalized;
+    let separator = items.iter().position(|a| a == "--").unwrap_or(items.len());
     let pos = args(
-        items,
+        &items[..separator],
         &[
             "--count",
             "--first-parent",
@@ -923,53 +966,48 @@ fn history(repo: &Repo, store: &mut Store<'_>, items: &[String], list: bool) -> 
             "--format=",
             "--pretty=",
             "--date=",
+            "--all",
+            "--graph",
+            "--decorate",
+            "--decorate=",
+            "--no-decorate",
+            "--reverse",
         ],
     )?;
-    let value = one(&pos, "HEAD")?;
-    let (tip, exclude) = if let Some((a, b)) = value.split_once("..") {
-        ensure!(!b.starts_with('.'), "symmetric ranges are unsupported");
-        (
-            revision::commit(repo, store, if b.is_empty() { "HEAD" } else { b })?,
-            Some(revision::commit(
-                repo,
-                store,
-                if a.is_empty() { "HEAD" } else { a },
-            )?),
-        )
-    } else {
-        (revision::commit(repo, store, value)?, None)
-    };
-    let ids = revision::history(store, tip, exclude, flag(items, "--first-parent"))?;
-    let allowed: HashSet<_> = ids.into_iter().collect();
-    let mut pending = std::collections::BinaryHeap::new();
-    let mut seen = HashSet::new();
-    let mut serial = 0usize;
-    let mut dated = Vec::new();
-    pending.push((
-        timestamp(&store.get(tip)?.data),
-        std::cmp::Reverse(serial),
-        tip,
-    ));
-    while let Some((time, _, id)) = pending.pop() {
-        if !allowed.contains(&id) || !seen.insert(id) {
-            continue;
-        }
-        dated.push((id, time));
-        for parent in store.get(id)?.commit()?.1 {
-            if allowed.contains(&parent) && !seen.contains(&parent) {
-                serial += 1;
-                pending.push((
-                    timestamp(&store.get(parent)?.data),
-                    std::cmp::Reverse(serial),
-                    parent,
-                ));
-                ensure!(
-                    pending.len() <= crate::object::MAX_OBJECTS * 4,
-                    "log traversal exceeds limit"
-                );
+    let mut ids = crate::inspect::history_ids(
+        repo,
+        store,
+        &pos,
+        flag(items, "--all"),
+        flag(items, "--first-parent"),
+    )?;
+    if separator < items.len() {
+        let specs = crate::workflow::paths(&items[separator + 1..], prefix)?;
+        let mut filtered = Vec::new();
+        for id in ids {
+            if crate::inspect::changed(store, id, &specs)? {
+                filtered.push(id);
             }
         }
+        ids = filtered;
     }
+    ensure!(
+        !flag(items, "--reverse") || !flag(items, "--graph"),
+        "--graph and --reverse are incompatible"
+    );
+    if flag(items, "--reverse") {
+        ids.reverse();
+    }
+    let decorate = (flag(items, "--decorate") || option(items, "--decorate=").is_some())
+        && !flag(items, "--no-decorate");
+    let decorations = if decorate {
+        crate::inspect::decorations(repo)?
+    } else {
+        HashMap::new()
+    };
+    let mut graph = crate::inspect::Graph::default();
+    let dated: Vec<_> = ids.into_iter().map(|id| (id, 0i64)).collect();
+    let mut dated = dated;
     let max = if flag(items, "-1") {
         1
     } else {
@@ -985,15 +1023,36 @@ fn history(repo: &Repo, store: &mut Store<'_>, items: &[String], list: bool) -> 
     }
     let mut first = true;
     for (id, _) in dated {
+        let decoration = decorations
+            .get(&id)
+            .map(|v| format!(" ({})", v.join(", ")))
+            .unwrap_or_default();
+        let (graph_prefix, transition) = if flag(items, "--graph") {
+            graph.prefix(id, &store.parents(id)?)?
+        } else {
+            (String::new(), None)
+        };
+
         if list {
             println!("{id}");
             continue;
         }
+        let continuation = if flag(items, "--graph") {
+            graph.continuation()
+        } else {
+            String::new()
+        };
         let object = store.get(id)?;
         let subject = porcelain::subject(&object.data);
         let format = option(items, "--format=").or(option(items, "--pretty="));
         if flag(items, "--oneline") || format == Some("oneline") {
-            println!("{} {subject}", crate::output::short(id));
+            println!(
+                "{graph_prefix}{}{decoration} {subject}",
+                crate::output::short(id)
+            );
+            if let Some(transition) = transition {
+                println!("{transition}");
+            }
             continue;
         }
         let author = object
@@ -1070,7 +1129,15 @@ fn history(repo: &Repo, store: &mut Store<'_>, items: &[String], list: bool) -> 
                 rest = &rest[key.len()..];
             }
             rendered.push_str(rest);
-            println!("{}", text(&rendered));
+            for (n, line) in text(&rendered).lines().enumerate() {
+                println!(
+                    "{}{line}",
+                    if n == 0 { &graph_prefix } else { &continuation }
+                );
+            }
+            if let Some(transition) = transition {
+                println!("{transition}");
+            }
             continue;
         }
         let date = time::OffsetDateTime::from_unix_timestamp(seconds)?;
@@ -1080,14 +1147,17 @@ fn history(repo: &Repo, store: &mut Store<'_>, items: &[String], list: bool) -> 
             "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
         ];
         if !first {
-            println!();
+            println!("{continuation}");
         }
         first = false;
-        println!("commit {id}");
-        let parents = object.commit()?.1;
+        println!("{graph_prefix}commit {id}{decoration}");
+        if let Some(transition) = transition {
+            println!("{transition}");
+        }
+        let parents = store.parents(id)?;
         if parents.len() > 1 {
             println!(
-                "Merge: {}",
+                "{continuation}Merge: {}",
                 parents
                     .into_iter()
                     .map(crate::output::short)
@@ -1096,7 +1166,7 @@ fn history(repo: &Repo, store: &mut Store<'_>, items: &[String], list: bool) -> 
             );
         }
         println!(
-            "Author: {}\nDate:   {} {} {} {:02}:{:02}:{:02} {} {}\n",
+            "{continuation}Author: {}\n{continuation}Date:   {} {} {} {:02}:{:02}:{:02} {} {}\n{continuation}",
             text(who),
             days[date.weekday().number_days_from_monday() as usize],
             months[u8::from(date.month()) as usize - 1],
@@ -1116,7 +1186,7 @@ fn history(repo: &Repo, store: &mut Store<'_>, items: &[String], list: bool) -> 
             .trim_end_matches('\n')
             .lines()
         {
-            println!("    {}", text(line));
+            println!("{continuation}    {}", text(line));
         }
     }
     Ok(())

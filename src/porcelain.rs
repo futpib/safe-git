@@ -341,6 +341,9 @@ pub fn checkout(
             None
         }
     };
+    if let Some(branch) = &branch {
+        crate::linked::available(repo, branch)?;
+    }
     let reference = branch.as_deref().unwrap_or("HEAD");
     // A detached checkout must not overwrite the branch referenced by HEAD.
     // prepare_ref("HEAD") replaces HEAD itself with a direct object ID.

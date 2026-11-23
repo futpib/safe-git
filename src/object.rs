@@ -203,6 +203,12 @@ impl Object {
 pub type Objects = HashMap<Oid, Arc<Object>>;
 pub trait ReadObjects {
     fn get(&mut self, oid: Oid) -> Result<Arc<Object>>;
+    fn parents(&mut self, oid: Oid) -> Result<Vec<Oid>> {
+        Ok(self.get(oid)?.commit()?.1)
+    }
+    fn shallow(&self, _oid: Oid) -> bool {
+        false
+    }
 }
 
 pub fn reachable(store: &mut impl ReadObjects, tip: Oid) -> Result<Vec<Oid>> {
@@ -241,7 +247,10 @@ pub fn reachable_many_since(
             .checked_add(obj.data.len())
             .ok_or_else(|| anyhow::anyhow!("size overflow"))?;
         ensure!(bytes <= MAX_TOTAL, "reachable objects exceed byte limit");
-        let children = obj.children()?;
+        let mut children = obj.children()?;
+        if obj.kind == Kind::Commit && store.shallow(oid) {
+            children.retain(|(_, kind)| *kind != Kind::Commit);
+        }
         ensure!(
             pending.len() + children.len() <= MAX_OBJECTS * 4,
             "graph fanout exceeds limit"
@@ -261,7 +270,7 @@ pub fn commits(store: &mut impl ReadObjects, tips: &[Oid]) -> Result<HashSet<Oid
             continue;
         }
         ensure!(seen.len() <= MAX_OBJECTS, "commit history exceeds limit");
-        let (_, parents) = store.get(id)?.commit()?;
+        let parents = store.parents(id)?;
         ensure!(
             pending.len() + parents.len() <= MAX_OBJECTS * 4,
             "commit fanout exceeds limit"
@@ -285,7 +294,7 @@ pub fn ancestor(store: &mut impl ReadObjects, old: Oid, new: Oid) -> Result<bool
             seen.len() <= MAX_OBJECTS,
             "ancestry traversal exceeds limit"
         );
-        let (_, parents) = store.get(id)?.commit()?;
+        let parents = store.parents(id)?;
         ensure!(
             pending.len() + parents.len() <= MAX_OBJECTS * 4,
             "ancestry fanout exceeds limit"

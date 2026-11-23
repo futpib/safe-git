@@ -367,7 +367,9 @@ pub fn suite() {
         safe(&merge).fails();
         fs::remove_file(path).unwrap();
     }
-    passed("shallow, linked-repository, alternate object store, and graft metadata rejected");
+    passed(
+        "malformed shallow, unregistered linked-repository, alternate object store, and graft metadata rejected",
+    );
     for name in ["objects", "refs/remotes/origin", "config"] {
         let path = relay.join(name);
         let backup = path.with_file_name(format!(

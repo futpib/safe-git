@@ -40,7 +40,7 @@ pub async fn run(
         &trust::endpoint(repo, options.url, cli.remote_url.as_deref())?,
         &cli.repository,
     )?;
-    let mut binding = trust::get(repo)?;
+    let mut binding = trust::selected(repo, options.url)?;
     let head = repo.head()?;
     let default = head.strip_prefix("refs/heads/");
     let mut specs = options.specs.to_vec();

@@ -86,20 +86,13 @@ pub fn resolve(repo: &Repo, store: &mut Store<'_>, value: &str) -> Result<Oid> {
         if value.as_bytes()[position] == b'^' {
             if count > 0 {
                 id = *store
-                    .get(id)?
-                    .commit()?
-                    .1
+                    .parents(id)?
                     .get(count - 1)
                     .context("missing parent")?;
             }
         } else {
             for _ in 0..count {
-                id = *store
-                    .get(id)?
-                    .commit()?
-                    .1
-                    .first()
-                    .context("missing parent")?;
+                id = *store.parents(id)?.first().context("missing parent")?;
             }
         }
         return Ok(id);
@@ -218,7 +211,7 @@ pub fn history(
         }
         ensure!(seen.len() <= MAX_OBJECTS, "history exceeds limit");
         out.push(id);
-        let parents = store.get(id)?.commit()?.1;
+        let parents = store.parents(id)?;
         todo.extend(
             parents
                 .into_iter()
@@ -237,7 +230,7 @@ pub fn merge_base(store: &mut impl ReadObjects, a: Oid, b: Oid) -> Result<Oid> {
     let common: HashSet<_> = left.intersection(&right).copied().collect();
     let mut ancestors = HashSet::new();
     for id in &common {
-        for parent in store.get(*id)?.commit()?.1 {
+        for parent in store.parents(*id)? {
             if common.contains(&parent) {
                 ancestors.insert(parent);
             }

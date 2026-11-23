@@ -141,6 +141,18 @@ pub(crate) fn request(ad: &Advertisement, tips: &[Oid], haves: &[Oid]) -> Result
         !tips.is_empty() && tips.len() <= 100_000,
         "invalid want count"
     );
+    request_depth(ad, tips, haves, None)
+}
+pub(crate) fn request_depth(
+    ad: &Advertisement,
+    tips: &[Oid],
+    haves: &[Oid],
+    depth: Option<u32>,
+) -> Result<Vec<u8>> {
+    ensure!(
+        !tips.is_empty() && tips.len() <= 100_000,
+        "invalid want count"
+    );
     let mut caps = String::new();
     for capability in ["ofs-delta", "no-progress"] {
         if ad.caps.contains(capability) {
@@ -152,6 +164,13 @@ pub(crate) fn request(ad: &Advertisement, tips: &[Oid], haves: &[Oid]) -> Result
     for (i, tip) in tips.iter().enumerate() {
         let caps = if i == 0 { caps.as_str() } else { "" };
         request.extend(transport::packet(format!("want {tip}{caps}\n").as_bytes())?);
+    }
+    if let Some(depth) = depth {
+        ensure!(
+            depth > 0 && ad.caps.contains("shallow"),
+            "server does not support shallow fetch"
+        );
+        request.extend(transport::packet(format!("deepen {depth}\n").as_bytes())?);
     }
     request.extend_from_slice(b"0000");
     ensure!(haves.len() <= 32, "too many negotiation tips");
@@ -326,9 +345,81 @@ impl Push {
     }
 }
 
+pub async fn fetch_depth(
+    remote: &Remote,
+    auth: &Auth,
+    refs: &HashMap<String, Oid>,
+    depth: u32,
+) -> Result<crate::network::Fetched> {
+    let mut wire = Wire::connect(remote, auth, false).await?;
+    let ad = advertise(&mut wire).await?;
+    for (name, id) in refs {
+        ensure!(
+            ad.refs.get(name) == Some(id),
+            "remote ref changed while fetching; retry"
+        );
+    }
+    let tips: Vec<_> = refs
+        .values()
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    wire.send(request_depth(&ad, &tips, &[], Some(depth))?)
+        .await?;
+    wire.eof().await?;
+    let mut shallow = HashSet::new();
+    while let Some(line) = wire.packet().await? {
+        shallow_line(&line, &mut shallow)?;
+    }
+    check_ack(
+        &wire
+            .packet()
+            .await?
+            .context("missing negotiation response")?,
+        &[],
+    )?;
+    Ok(crate::network::Fetched {
+        objects: decode_pack(&wire.remainder().await?, &[])?,
+        shallow,
+    })
+}
+pub(crate) fn shallow_line(line: &[u8], shallow: &mut HashSet<Oid>) -> Result<()> {
+    let value = line
+        .strip_prefix(b"shallow ")
+        .map(|v| v.strip_suffix(b"\n").unwrap_or(v))
+        .with_context(|| {
+            format!(
+                "invalid shallow response: {:?}",
+                String::from_utf8_lossy(line)
+            )
+        })?;
+    ensure!(
+        shallow.len() < crate::object::MAX_OBJECTS && shallow.insert(Oid::parse(value)?),
+        "duplicate or excessive shallow boundaries"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shallow_boundaries_are_bounded_data_with_optional_newlines() {
+        for suffix in ["", "\n"] {
+            let mut ids = HashSet::new();
+            let line = format!("shallow 1111111111111111111111111111111111111111{suffix}");
+            shallow_line(line.as_bytes(), &mut ids).unwrap();
+            assert!(shallow_line(line.as_bytes(), &mut ids).is_err());
+        }
+        for bad in [
+            "unshallow 1111111111111111111111111111111111111111",
+            "shallow ../outside",
+            "shallow 1111111111111111111111111111111111111111\nexec x",
+        ] {
+            assert!(shallow_line(bad.as_bytes(), &mut HashSet::new()).is_err());
+        }
+    }
     #[test]
     fn clone_head_selection_validates_symrefs_and_ambiguity() {
         let mut ad = Advertisement::new();

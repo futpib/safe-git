@@ -4,6 +4,8 @@
 mod bootstrap;
 #[path = "suites/extended.rs"]
 mod extended;
+#[path = "suites/gaps.rs"]
+mod gaps;
 #[path = "suites/http_packages.rs"]
 mod http_packages;
 #[path = "suites/output.rs"]
@@ -33,6 +35,30 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("gaps_edge_safety", || {
+                gaps::edge_safety();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("gaps_inspection_files", || {
+                gaps::inspection_files();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("gaps_tags_remotes", || {
+                gaps::tags_remotes();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("gaps_sequences_bisect", || {
+                gaps::sequences_bisect();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("gaps_linked_submodules", || {
+                gaps::linked_submodules();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("gaps_shallow_network", || {
+                gaps::shallow_network();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("extended_ssh_push", || {
                 extended::ssh_push();
                 Ok(())

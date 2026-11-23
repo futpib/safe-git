@@ -1,11 +1,15 @@
 mod archive;
+mod bisect;
 mod checkout;
 mod clone;
 mod compat;
 mod config;
+mod files;
 mod history;
 mod ignore;
 mod index;
+mod inspect;
+mod linked;
 mod network;
 mod object;
 mod output;
@@ -15,10 +19,14 @@ mod patch;
 mod porcelain;
 mod protocol;
 mod push;
+mod remotes;
 mod repo;
 mod revision;
 mod sequence;
+mod shallow;
 mod stash;
+mod submodule;
+mod tags;
 mod transport;
 mod trust;
 mod workflow;
@@ -34,7 +42,7 @@ use transport::Auth;
 #[command(
     version = env!("SAFE_GIT_VERSION"),
     about = "Git operations without repository-directed execution",
-    after_help = "Everyday commands: status, add, switch, restore, diff, log, commit, stash.\nAdditional commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, branch, reset, reflog, checkout, rebase, cherry-pick, revert, tag --list, rev-list, describe,\narchive --format tar. Unsupported options fail closed."
+    after_help = "Everyday commands: status, add, switch, restore, diff, log, commit, stash.\nAdditional commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, branch, reset, reflog, checkout, rebase, cherry-pick, revert, tag, rev-list, describe,\narchive --format tar, show, blame, rm, mv, clean, remote, worktree, bisect, submodule. Unsupported options fail closed."
 )]
 struct Cli {
     /// Repository or a directory within its working tree
@@ -75,6 +83,8 @@ struct Cli {
 enum Command {
     /// Clone verified objects into a new or empty repository
     Clone {
+        #[arg(long,value_parser=clap::value_parser!(u32).range(1..))]
+        depth: Option<u32>,
         /// Select a branch instead of the remote's advertised default
         #[arg(short, long)]
         branch: Option<String>,
@@ -106,6 +116,8 @@ enum Command {
     },
     /// Fetch one branch from an explicit SSH URL into a tracking ref
     Fetch {
+        #[arg(long)]
+        unshallow: bool,
         url: Option<String>,
         branch: Option<String>,
         /// Storage label only; never resolves a configured remote
@@ -122,6 +134,8 @@ enum Command {
     },
     /// Fetch one branch and integrate it without repository-selected commands
     Pull {
+        #[arg(long, conflicts_with = "ff_only")]
+        rebase: bool,
         #[arg(long)]
         ff_only: bool,
         /// Submodules are always inert; accepted for Git command compatibility
@@ -195,6 +209,7 @@ async fn run(cli: &Cli) -> Result<()> {
         return compat::run(cli, args).await;
     }
     if let Command::Clone {
+        depth,
         url,
         path,
         branch,
@@ -223,9 +238,10 @@ async fn run(cli: &Cli) -> Result<()> {
             &network::normalize_from(url, &cli.repository)?,
             &cli.auth()?,
             clone::Options {
+                depth: *depth,
                 branch: branch.as_deref(),
                 remote: origin,
-                single: *single_branch,
+                single: *single_branch || depth.is_some(),
                 bare: *bare || *mirror,
                 mirror: *mirror,
                 quiet: cli.quiet,
@@ -275,6 +291,7 @@ async fn run(cli: &Cli) -> Result<()> {
         | Command::Recover
         | Command::Compatibility(_) => unreachable!(),
         Command::Fetch {
+            unshallow,
             url,
             branch,
             remote,
@@ -282,16 +299,46 @@ async fn run(cli: &Cli) -> Result<()> {
             all,
             ..
         } => {
-            if branch.is_none()
-                && cli.remote_url.is_none()
-                && (url.is_none()
-                    || trust::get(&repo)?.is_some_and(|b| url.as_deref() == Some(&b.remote)))
-            {
-                compat::fetch_all(cli, &repo, &mut store, *prune).await?;
+            let registered = trust::selected(&repo, url.as_deref())?;
+            if *unshallow {
+                ensure!(!store.shallow.is_empty(), "repository is not shallow");
+                let endpoint = network::normalize_from(
+                    &trust::endpoint(&repo, url.as_deref(), cli.remote_url.as_deref())?,
+                    &cli.repository,
+                )?;
+                let ad = network::discover(&endpoint, &cli.auth()?).await?;
+                let refs = ad
+                    .refs
+                    .into_iter()
+                    .filter(|(r, _)| r.starts_with("refs/heads/"))
+                    .collect();
+                let objects = network::fetch(&endpoint, &cli.auth()?, &refs, &[]).await?;
+                store.add(objects)?;
+                let boundaries = std::mem::take(&mut store.shallow);
+                for id in boundaries {
+                    for object in reachable(&mut store, id)? {
+                        repo.write_object(store.get(object)?.as_ref())?;
+                    }
+                }
+                repo.remove("shallow")?;
+            }
+            if *all {
+                ensure!(
+                    url.is_none() && branch.is_none() && cli.remote_url.is_none(),
+                    "--all takes no endpoint or branch"
+                );
+                let registry = trust::registry(&repo)?;
+                ensure!(!registry.remotes.is_empty(), "no registered remotes");
+                for binding in registry.remotes.values() {
+                    compat::fetch_binding(cli, &repo, &mut store, *prune, binding).await?;
+                }
+            } else if branch.is_none() && cli.remote_url.is_none() && registered.is_some() {
+                compat::fetch_binding(cli, &repo, &mut store, *prune, registered.as_ref().unwrap())
+                    .await?;
             } else {
                 ensure!(
-                    !all && !prune,
-                    "--all/--prune require the registered remote"
+                    !prune,
+                    "--prune requires a registered remote without a branch"
                 );
                 fetch(
                     cli,
@@ -299,12 +346,18 @@ async fn run(cli: &Cli) -> Result<()> {
                     &mut store,
                     url.as_deref(),
                     branch.as_deref(),
-                    Some(remote),
+                    Some(
+                        registered
+                            .as_ref()
+                            .map(|b| b.remote.as_str())
+                            .unwrap_or(remote),
+                    ),
                 )
                 .await?;
             }
         }
         Command::Pull {
+            rebase,
             url,
             branch,
             no_stat,
@@ -312,7 +365,7 @@ async fn run(cli: &Cli) -> Result<()> {
             ..
         } => {
             let head = repo.head()?;
-            let binding = trust::get(&repo)?;
+            let binding = trust::selected(&repo, url.as_deref())?;
             let endpoint = trust::endpoint(&repo, url.as_deref(), cli.remote_url.as_deref())?;
             let default_branch = binding
                 .as_ref()
@@ -331,7 +384,9 @@ async fn run(cli: &Cli) -> Result<()> {
             )
             .await?;
             ensure!(repo.head()? == head, "HEAD changed during pull; retry");
-            if *ff_only {
+            if *rebase {
+                sequence::run(cli, &repo, &mut store, "rebase", &[incoming.to_string()])?;
+            } else if *ff_only {
                 merge(&repo, &mut store, incoming, cli.quiet, *no_stat)?;
             } else {
                 sequence::merge(cli, &repo, &mut store, incoming, false, false)?;
@@ -426,6 +481,9 @@ async fn fetch(
             store.get(id)?.commit()?;
             haves.push(id);
         }
+    }
+    if !store.shallow.is_empty() {
+        haves.clear();
     }
     let boundary = commits(store, &haves)?;
     let endpoint = trust::endpoint(repo, url, cli.remote_url.as_deref())?;

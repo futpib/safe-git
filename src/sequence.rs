@@ -410,7 +410,7 @@ fn control(cli: &Cli, repo: &Repo, store: &mut Store<'_>, kind: &str, action: &s
 }
 fn interactive(steps: Vec<Step>) -> Result<Vec<Step>> {
     for step in &steps {
-        println!("pick {}", step.id);
+        println!("{} {}", step.action, step.id);
     }
     println!(
         "Enter pick/reword/edit/squash/fixup/drop COMMIT [message] lines, then done. Enter done alone to keep this order. Commands and editors are never run."
@@ -482,12 +482,19 @@ pub fn run(
     let mut no_commit = false;
     let mut mainline = None;
     let mut interactive_rebase = false;
+    let mut onto = None;
+    let mut autosquash = false;
     let mut values = Vec::new();
     let mut items = args.iter();
     while let Some(arg) = items.next() {
         match arg.as_str() {
             "-n" | "--no-commit" => no_commit = true,
             "-i" | "--interactive" if kind == "rebase" => interactive_rebase = true,
+            "--onto" if kind == "rebase" => {
+                onto = Some(items.next().context("missing --onto target")?.as_str())
+            }
+            a if kind == "rebase" && a.starts_with("--onto=") => onto = Some(&a[7..]),
+            "--autosquash" if kind == "rebase" => autosquash = true,
             "-m" | "--mainline" => {
                 mainline = Some(items.next().context("missing mainline")?.parse::<usize>()?)
             }
@@ -495,6 +502,12 @@ pub fn run(
             a if a.starts_with('-') => bail!("unsupported {kind} option {a}"),
             _ => values.push(arg.as_str()),
         }
+    }
+    if kind == "rebase" && values.len() == 2 {
+        let tip = repo.read_ref("HEAD")?.context("unborn HEAD")?;
+        clean(repo, store, tip)?;
+        porcelain::checkout(repo, store, values[1], None, false, cli.quiet)?;
+        values.truncate(1);
     }
     let branch = repo.head()?;
     let original = repo.read_ref(&branch)?.context("unborn HEAD")?;
@@ -515,17 +528,28 @@ pub fn run(
     };
     if kind == "rebase" {
         ensure!(values.len() <= 1, "rebase accepts one upstream");
-        let upstream = revision::upstream(repo)?;
-        let incoming = revision::commit(repo, store, values.first().copied().unwrap_or(&upstream))?;
-        let base = revision::merge_base(store, original, incoming)?;
-        let excluded = crate::object::commits(store, &[incoming])?;
+        let upstream = match values.first() {
+            Some(v) => (*v).to_owned(),
+            None => revision::upstream(repo)?,
+        };
+        let excluded_tip = revision::commit(repo, store, &upstream)?;
+        let incoming = match onto {
+            Some(v) => revision::commit(repo, store, v)?,
+            None => excluded_tip,
+        };
+        let base = if onto.is_none() {
+            Some(revision::merge_base(store, original, incoming)?)
+        } else {
+            None
+        };
+        let excluded = crate::object::commits(store, &[excluded_tip])?;
         let mut visited = BTreeSet::new();
         let mut pending = vec![(original, false)];
         while let Some((id, expanded)) = pending.pop() {
             if excluded.contains(&id) {
                 continue;
             }
-            let parents = store.get(id)?.commit()?.1;
+            let parents = store.parents(id)?;
             if expanded {
                 if parents.len() <= 1 {
                     state.steps.push(Step {
@@ -547,10 +571,13 @@ pub fn run(
             pending.push((id, true));
             pending.extend(parents.into_iter().rev().map(|id| (id, false)));
         }
+        if autosquash {
+            state.steps = squash_plan(store, state.steps)?;
+        }
         if interactive_rebase {
             state.steps = interactive(state.steps)?;
         }
-        if incoming == base && !interactive_rebase {
+        if Some(incoming) == base && !interactive_rebase && !autosquash && onto.is_none() {
             return Ok(());
         }
         save(repo, &state)?;
@@ -667,4 +694,40 @@ pub fn amend_allowed(repo: &Repo) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn squash_plan(store: &mut Store<'_>, steps: Vec<Step>) -> Result<Vec<Step>> {
+    let mut out: Vec<Step> = Vec::new();
+    let mut subjects: Vec<String> = Vec::new();
+    for mut step in steps {
+        let subject = porcelain::subject(&store.get(step.id)?.data);
+        if let Some((action, target)) = subject
+            .strip_prefix("fixup! ")
+            .map(|v| ("fixup", v))
+            .or_else(|| subject.strip_prefix("squash! ").map(|v| ("squash", v)))
+        {
+            let matches: Vec<_> = subjects
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| {
+                    out[*i].action == "pick"
+                        && (s.as_str() == target || out[*i].id.to_string().starts_with(target))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if matches.len() == 1 {
+                let mut at = matches[0] + 1;
+                while at < out.len() && matches!(out[at].action.as_str(), "fixup" | "squash") {
+                    at += 1;
+                }
+                step.action = action.into();
+                out.insert(at, step);
+                subjects.insert(at, subject);
+                continue;
+            }
+        }
+        subjects.push(subject);
+        out.push(step);
+    }
+    Ok(out)
 }
