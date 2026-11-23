@@ -189,11 +189,19 @@ pub fn quote(value: &str) -> String {
     )
 }
 pub fn local(repo: &Repo) -> Result<BTreeMap<String, String>> {
-    parse(
+    let mut values = parse(
         &repo
             .read("config", 8 * 1024 * 1024)?
             .context("missing config")?,
-    )
+    )?;
+    if values
+        .get("extensions.worktreeconfig")
+        .is_some_and(|v| v == "true")
+        && let Some(bytes) = repo.read("config.worktree", 8 * 1024 * 1024)?
+    {
+        values.extend(parse(&bytes)?);
+    }
+    Ok(values)
 }
 pub fn get(repo: &Repo, overrides: &[String], key: &str) -> Result<Option<String>> {
     let mut value = None;

@@ -10,6 +10,119 @@ use std::{
     collections::BTreeSet,
     io::{BufRead, Read, Write},
 };
+pub(crate) fn input(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut bytes = Vec::new();
+    let n = std::io::stdin()
+        .lock()
+        .take(65537)
+        .read_until(b'\n', &mut bytes)?;
+    ensure!(
+        n > 0 && n <= 65536,
+        "missing or oversized interactive answer"
+    );
+    Ok(String::from_utf8(bytes)?)
+}
+fn choose(
+    lines: &[diffy::Line<'_, [u8]>],
+    rest: &mut Option<bool>,
+    split: bool,
+) -> Result<Vec<u8>> {
+    let content = |yes: bool| {
+        lines
+            .iter()
+            .filter_map(|l| match l {
+                diffy::Line::Context(v) => Some(*v),
+                diffy::Line::Insert(v) if yes => Some(*v),
+                diffy::Line::Delete(v) if !yes => Some(*v),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    if let Some(yes) = rest {
+        return Ok(content(*yes));
+    }
+    loop {
+        match input("Apply this hunk? [y,n,a,d,q,s,e] ")?.trim() {
+            "y" => return Ok(content(true)),
+            "n" => return Ok(content(false)),
+            "a" => {
+                *rest = Some(true);
+                return Ok(content(true));
+            }
+            "d" | "q" => {
+                *rest = Some(false);
+                return Ok(content(false));
+            }
+            "s" if split => {
+                let mut out = Vec::new();
+                let mut start = 0;
+                while start < lines.len() {
+                    if let diffy::Line::Context(v) = &lines[start] {
+                        out.extend_from_slice(v);
+                        start += 1;
+                        continue;
+                    }
+                    let end = lines[start..]
+                        .iter()
+                        .position(|l| matches!(l, diffy::Line::Context(_)))
+                        .map_or(lines.len(), |i| start + i);
+                    for l in &lines[start..end] {
+                        match l {
+                            diffy::Line::Delete(v) => {
+                                print!("-{}", compat::text(&String::from_utf8_lossy(v)))
+                            }
+                            diffy::Line::Insert(v) => {
+                                print!("+{}", compat::text(&String::from_utf8_lossy(v)))
+                            }
+                            _ => {}
+                        }
+                    }
+                    out.extend(choose(&lines[start..end], rest, false)?);
+                    start = end;
+                }
+                return Ok(out);
+            }
+            "e" => {
+                println!(
+                    "Enter hunk lines prefixed with space, - or +; finish with a single dot. The old lines must still match."
+                );
+                let (mut old, mut new) = (Vec::new(), Vec::new());
+                loop {
+                    let line = input("")?;
+                    if line.trim_end_matches(['\n', '\r']) == "." {
+                        break;
+                    }
+                    let prefix = line.as_bytes()[0];
+                    let data = &line.as_bytes()[1..];
+                    ensure!(
+                        matches!(prefix, b' ' | b'-' | b'+'),
+                        "edited lines require a space, - or + prefix"
+                    );
+                    if prefix != b'+' {
+                        old.extend_from_slice(data);
+                    }
+                    if prefix != b'-' {
+                        new.extend_from_slice(data);
+                    }
+                    ensure!(
+                        old.len() + new.len() <= 16 * 1024 * 1024,
+                        "edited hunk exceeds limit"
+                    );
+                }
+                ensure!(
+                    old == content(false),
+                    "edited hunk does not match the original lines; index unchanged"
+                );
+                return Ok(new);
+            }
+            _ => println!("Choose y, n, a, d, q, s, or e."),
+        }
+    }
+}
 fn answer(prompt: &str, rest: &mut Option<bool>) -> Result<bool> {
     if let Some(value) = rest {
         return Ok(*value);
@@ -116,15 +229,7 @@ pub fn select(
                 };
                 print!("{prefix}{}", compat::text(&String::from_utf8_lossy(bytes)));
             }
-            let yes = answer("Apply this hunk?", &mut rest)?;
-            for line in hunk.lines() {
-                match line {
-                    diffy::Line::Context(v) => data.extend_from_slice(v),
-                    diffy::Line::Insert(v) if yes => data.extend_from_slice(v),
-                    diffy::Line::Delete(v) if !yes => data.extend_from_slice(v),
-                    _ => {}
-                }
-            }
+            data.extend(choose(hunk.lines(), &mut rest, true)?);
             cursor = start + hunk.old_range().len();
         }
         for line in &lines[cursor..] {

@@ -23,6 +23,8 @@ pub(crate) struct Step {
 #[derive(Serialize, Deserialize)]
 struct State {
     kind: String,
+    #[serde(default)]
+    root_base: Option<Oid>,
     branch: String,
     original: Oid,
     current: Oid,
@@ -270,6 +272,8 @@ fn create(
         state.rebase_parents.clone()
     } else if let Some(other) = state.merge_parent {
         vec![state.current, other]
+    } else if state.root_base == Some(state.current) {
+        Vec::new()
     } else {
         vec![state.current]
     };
@@ -491,6 +495,69 @@ pub fn run(
     kind: &str,
     args: &[String],
 ) -> Result<()> {
+    const AUTO: &str = "safe-git-autostash";
+    let autostash = args.iter().any(|a| a == "--autostash");
+    ensure!(
+        !autostash || kind == "rebase",
+        "--autostash is a rebase option"
+    );
+    if repo.exists(AUTO)? && !repo.exists(STATE)? {
+        ensure!(
+            kind == "rebase" && args == ["--continue"],
+            "autostash needs restoration; run rebase --continue"
+        );
+        return restore_autostash(cli, repo, store);
+    }
+    if autostash {
+        ensure!(
+            !repo.exists(STATE)? && !repo.exists(AUTO)?,
+            "operation in progress"
+        );
+        let prior = repo.read_ref("refs/stash")?;
+        crate::stash::run(
+            cli,
+            repo,
+            store,
+            &[
+                "push".into(),
+                "-m".into(),
+                "safe-git rebase autostash".into(),
+            ],
+        )?;
+        if let Some(id) = repo.read_ref("refs/stash")?.filter(|id| Some(*id) != prior) {
+            repo.atomic(AUTO, id.to_string().as_bytes())?;
+        }
+    }
+    let args = args
+        .iter()
+        .filter(|a| a.as_str() != "--autostash")
+        .cloned()
+        .collect::<Vec<_>>();
+    let result = run_inner(cli, repo, store, kind, &args);
+    if !repo.exists(STATE)? && repo.exists(AUTO)? {
+        restore_autostash(cli, repo, store)?;
+    }
+    result
+}
+fn restore_autostash(cli: &Cli, repo: &Repo, store: &mut Store<'_>) -> Result<()> {
+    let bytes = repo
+        .read("safe-git-autostash", 128)?
+        .context("missing autostash")?;
+    let saved = Oid::parse(&bytes)?;
+    ensure!(
+        repo.read_ref("refs/stash")? == Some(saved),
+        "autostash stack changed; saved work remains in stash {saved}"
+    );
+    crate::stash::run(cli, repo, store, &["pop".into(), "--index".into()]).context("autostash could not be restored; saved work remains in stash, run rebase --continue to retry")?;
+    repo.remove("safe-git-autostash")
+}
+fn run_inner(
+    cli: &Cli,
+    repo: &Repo,
+    store: &mut Store<'_>,
+    kind: &str,
+    args: &[String],
+) -> Result<()> {
     if args.len() == 1 && matches!(args[0].as_str(), "--continue" | "--abort" | "--skip") {
         return control(cli, repo, store, kind, &args[0]);
     }
@@ -498,6 +565,7 @@ pub fn run(
         !repo.exists(STATE)?,
         "operation in progress; continue or abort it first"
     );
+    let mut root = false;
     let mut no_commit = false;
     let mut mainline = None;
     let mut interactive_rebase = false;
@@ -511,6 +579,7 @@ pub fn run(
         match arg.as_str() {
             "-n" | "--no-commit" => no_commit = true,
             "-i" | "--interactive" if kind == "rebase" => interactive_rebase = true,
+            "--root" if kind == "rebase" => root = true,
             "--onto" if kind == "rebase" => {
                 onto = Some(items.next().context("missing --onto target")?.as_str())
             }
@@ -544,6 +613,7 @@ pub fn run(
     clean(repo, store, original)?;
     let mut state = State {
         kind: kind.into(),
+        root_base: None,
         branch,
         original,
         current: original,
@@ -560,16 +630,38 @@ pub fn run(
     };
     if kind == "rebase" {
         ensure!(values.len() <= 1, "rebase accepts one upstream");
+        ensure!(
+            !root || values.is_empty(),
+            "--root cannot be combined with an upstream"
+        );
         let upstream = match values.first() {
             Some(v) => (*v).to_owned(),
+            None if root => String::new(),
             None => revision::upstream(repo)?,
         };
-        let excluded_tip = revision::commit(repo, store, &upstream)?;
+        let excluded_tip = if root {
+            let tree = porcelain::write_tree(repo, &Entries::new())?;
+            let identity = porcelain::identity(repo, &cli.config, "COMMITTER")?;
+            let id = porcelain::new_commit(
+                repo,
+                tree,
+                &[],
+                &identity,
+                &identity,
+                b"temporary rebase root",
+            )?;
+            if onto.is_none() {
+                state.root_base = Some(id);
+            }
+            id
+        } else {
+            revision::commit(repo, store, &upstream)?
+        };
         let incoming = match onto {
             Some(v) => revision::commit(repo, store, v)?,
             None => excluded_tip,
         };
-        let base = if onto.is_none() {
+        let base = if onto.is_none() && !root {
             Some(revision::merge_base(store, original, incoming)?)
         } else {
             None
@@ -609,7 +701,11 @@ pub fn run(
         }
         state.labels.insert("onto".into(), incoming);
         if preserve {
-            let fork = revision::merge_base(store, original, excluded_tip)?;
+            let fork = if root {
+                excluded_tip
+            } else {
+                revision::merge_base(store, original, excluded_tip)?
+            };
             state.steps =
                 crate::rebase_plan::graph(store, state.steps, fork, cousins, &mut state.labels)?;
         }
@@ -657,6 +753,7 @@ pub fn merge(
     clean(repo, store, old)?;
     let mut state = State {
         kind: "merge".into(),
+        root_base: None,
         branch,
         original: old,
         current: old,

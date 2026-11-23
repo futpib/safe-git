@@ -519,6 +519,7 @@ impl Drop for Pending {
 fn validate_config(bytes: &[u8]) -> Result<bool> {
     let config = std::str::from_utf8(bytes).context("config is not UTF-8")?;
     let mut core = false;
+    let mut extensions = false;
     let mut bare = None;
     let mut version = None;
     for line in config.lines() {
@@ -529,12 +530,23 @@ fn validate_config(bytes: &[u8]) -> Result<bool> {
         if line.starts_with('[') {
             ensure!(line.ends_with(']'), "unsupported config section syntax");
             let section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            extensions = section == "extensions";
             ensure!(
-                section != "extensions" && !section.starts_with("extensions "),
-                "repository extensions are unsupported"
+                !section.starts_with("extensions "),
+                "invalid extensions section"
             );
             core = section == "core";
             continue;
+        }
+        if extensions {
+            let (key, value) = line
+                .split_once('=')
+                .context("invalid repository extension")?;
+            ensure!(
+                key.trim().eq_ignore_ascii_case("worktreeconfig")
+                    && matches!(value.trim(), "true" | "false"),
+                "unsupported repository extension"
+            );
         }
         if !core {
             continue;

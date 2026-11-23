@@ -387,7 +387,7 @@ fn apply_inner(
         .context("acquire Git index lock")?;
     let original = repo.read("index", INDEX_LIMIT)?;
     let (mut index, conflicts) = match &original {
-        Some(bytes) => index::decode_full(bytes)?,
+        Some(bytes) => index::decode_repo(repo, bytes)?,
         None => Default::default(),
     };
     ensure!(
@@ -833,7 +833,7 @@ pub fn recover(repo: &Repo) -> Result<()> {
         "old index backup checksum mismatch"
     );
     if let Some(bytes) = &old_index {
-        index::decode(bytes)?;
+        index::decode_repo(repo, bytes)?;
     }
     let current_index = repo.read("index", INDEX_LIMIT)?;
     let current_hash = current_index

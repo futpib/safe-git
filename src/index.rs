@@ -137,6 +137,7 @@ pub fn no_prefix_conflicts(entries: &Entries) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
 pub fn decode(bytes: &[u8]) -> Result<Entries> {
     let (entries, conflicts) = decode_full(bytes)?;
     ensure!(
@@ -145,7 +146,20 @@ pub fn decode(bytes: &[u8]) -> Result<Entries> {
     );
     Ok(entries)
 }
+#[cfg(test)]
 pub fn decode_full(bytes: &[u8]) -> Result<(Entries, Conflicts)> {
+    crate::extended_index::decode(None, bytes)
+}
+pub fn decode_repo(repo: &crate::repo::Repo, bytes: &[u8]) -> Result<(Entries, Conflicts)> {
+    crate::extended_index::decode(Some(repo), bytes)
+}
+pub(crate) type Records = Vec<(Vec<u8>, u16, Entry)>;
+pub(crate) struct RawIndex {
+    pub records: Records,
+    pub link: Option<Vec<u8>>,
+    pub sparse: bool,
+}
+pub(crate) fn decode_raw(bytes: &[u8]) -> Result<RawIndex> {
     ensure!(
         bytes.len() >= 32 && &bytes[..4] == b"DIRC",
         "invalid Git index"
@@ -160,15 +174,16 @@ pub fn decode_full(bytes: &[u8]) -> Result<(Entries, Conflicts)> {
     let count = u32::from_be_bytes(bytes[8..12].try_into()?) as usize;
     ensure!(count <= MAX_OBJECTS, "index entry limit exceeded");
     let mut pos = 12;
-    let mut entries = Entries::new();
+    let mut records = Vec::new();
     let mut previous = Vec::<u8>::new();
-    let mut previous_stage = 0;
-    let mut conflicts = Conflicts::new();
+
     for _ in 0..count {
         let start = pos;
         ensure!(pos + 62 <= end, "truncated index entry");
         let mode = u32::from_be_bytes(bytes[pos + 24..pos + 28].try_into()?);
-        self::mode(mode)?;
+        if mode != 0o40000 {
+            self::mode(mode)?;
+        }
         let oid = Oid(bytes[pos + 40..pos + 60].try_into()?);
         let flags = u16::from_be_bytes(bytes[pos + 60..pos + 62].try_into()?);
         pos += 62;
@@ -221,7 +236,9 @@ pub fn decode_full(bytes: &[u8]) -> Result<(Entries, Conflicts)> {
             .context("unterminated index name")?;
         name.extend_from_slice(&bytes[pos..pos + nul]);
         pos += nul + 1;
-        path(&name)?;
+        if !name.is_empty() {
+            path(name.strip_suffix(b"/").unwrap_or(&name))?;
+        }
         ensure!(
             usize::from(flags & 0xfff) == name.len().min(0xfff),
             "index name length mismatch"
@@ -234,50 +251,49 @@ pub fn decode_full(bytes: &[u8]) -> Result<(Entries, Conflicts)> {
             );
             pos += pad;
         }
-        ensure!(
-            previous.is_empty()
-                || previous < name
-                || (previous == name && previous_stage < stage && previous_stage > 0),
-            "duplicate or unordered index entries"
-        );
         previous = name.clone();
-        previous_stage = stage;
-        if stage == 0 {
-            entries.insert(
-                name,
-                Entry {
-                    mode,
-                    oid,
-                    flags: extended,
-                },
-            );
-        } else {
-            conflicts.entry(name).or_insert([None; 3])[usize::from(stage) - 1] = Some(Entry {
+        records.push((
+            name,
+            stage,
+            Entry {
                 mode,
                 oid,
-                flags: 0,
-            });
-        }
+                flags: extended,
+            },
+        ));
     }
+    let mut link = None;
+    let mut sparse = false;
     while pos < end {
         ensure!(pos + 8 <= end, "truncated index extension");
         let signature = &bytes[pos..pos + 4];
         ensure!(
-            signature[0].is_ascii_uppercase(),
-            "required index extensions (split/sparse indexes) are unsupported"
+            signature[0].is_ascii_uppercase() || signature == b"link" || signature == b"sdir",
+            "unknown required index extension"
         );
         let size = u32::from_be_bytes(bytes[pos + 4..pos + 8].try_into()?) as usize;
         pos += 8;
         ensure!(size <= end - pos, "index extension exceeds input");
+        if signature == b"link" {
+            ensure!(link.is_none(), "duplicate split index extension");
+            link = Some(bytes[pos..pos + size].to_vec());
+        }
+        if signature == b"sdir" {
+            ensure!(!sparse && size == 0, "invalid sparse index extension");
+            sparse = true;
+        }
         pos += size;
     }
-    validate_conflicts(&entries, &conflicts)?;
-    Ok((entries, conflicts))
+    Ok(RawIndex {
+        records,
+        link,
+        sparse,
+    })
 }
 pub fn encode(entries: &Entries) -> Result<Vec<u8>> {
     encode_full(entries, &Conflicts::new())
 }
-fn validate_conflicts(entries: &Entries, conflicts: &Conflicts) -> Result<()> {
+pub(crate) fn validate_conflicts(entries: &Entries, conflicts: &Conflicts) -> Result<()> {
     let mut paths = entries.clone();
     for (path, stages) in conflicts {
         ensure!(

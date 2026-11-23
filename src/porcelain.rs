@@ -15,13 +15,21 @@ use std::{
 
 pub fn index(repo: &Repo) -> Result<Entries> {
     repo.read("index", checkout::INDEX_LIMIT)?
-        .map(|b| index::decode(&b))
+        .map(|b| {
+            index::decode_repo(repo, &b).and_then(|(e, c)| {
+                ensure!(
+                    c.is_empty(),
+                    "unmerged index entries; resolve conflicts and add the files first"
+                );
+                Ok(e)
+            })
+        })
         .transpose()
         .map(|v| v.unwrap_or_default())
 }
 pub fn index_full(repo: &Repo) -> Result<(Entries, index::Conflicts)> {
     repo.read("index", checkout::INDEX_LIMIT)?
-        .map(|b| index::decode_full(&b))
+        .map(|b| index::decode_repo(repo, &b))
         .transpose()
         .map(|v| v.unwrap_or_default())
 }
@@ -162,6 +170,7 @@ pub(crate) fn new_commit(
 }
 #[derive(Default)]
 pub struct CommitOptions {
+    pub signing_key: Option<russh::keys::PrivateKey>,
     pub all: bool,
     pub quiet: bool,
     pub amend: bool,
@@ -177,6 +186,7 @@ pub fn commit(
     options: CommitOptions,
 ) -> Result<()> {
     let CommitOptions {
+        signing_key,
         all,
         quiet,
         amend,
@@ -209,7 +219,12 @@ pub fn commit(
     let original = repo.read("index", checkout::INDEX_LIMIT)?;
     let staged = original
         .as_ref()
-        .map(|b| index::decode(b))
+        .map(|b| {
+            index::decode_repo(repo, b).and_then(|(e, c)| {
+                ensure!(c.is_empty(), "unmerged index entries");
+                Ok(e)
+            })
+        })
         .transpose()?
         .unwrap_or_default();
     let mut index_after = staged.clone();
@@ -296,6 +311,10 @@ pub fn commit(
         &identity(repo, overrides, "COMMITTER")?,
         message.as_bytes(),
     )?;
+    let id = match signing_key {
+        Some(key) => crate::signing::commit(repo, store, id, &key)?,
+        None => id,
+    };
     ensure!(
         repo.read("HEAD", 2048)?.as_deref() == Some(head_bytes.as_slice())
             && repo.read("index", checkout::INDEX_LIMIT)? == original,

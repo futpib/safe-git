@@ -225,6 +225,8 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             "apply",
             "am",
             "format-patch",
+            "fsck",
+            "gc",
             "sparse-checkout"
         ]
         .contains(&name),
@@ -259,6 +261,7 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
     );
     let mut store = Store::new(&repo);
     match name {
+        "fsck" | "gc" => crate::maintenance::run(&repo, &mut store, name, items, cli.quiet),
         "sparse-checkout" => crate::sparse::run(cli, &repo, &mut store, items),
         "grep" => crate::search::grep(cli, &repo, &mut store, items),
         "apply" | "am" | "format-patch" => crate::mail::run(cli, &repo, &mut store, name, items),
@@ -501,6 +504,8 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             crate::sequence::run(cli, &repo, &mut store, name, items)
         }
         "commit" => {
+            let mut sign = false;
+            let mut signing_path = cli.signing_key.clone();
             let mut message: Option<String> = None;
             let mut fixup = None;
             let mut amend = false;
@@ -521,6 +526,16 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                 match items[i].as_str() {
                     "--" => end = true,
                     "--allow-empty" => allow_empty = true,
+                    "-S" | "--gpg-sign" => sign = true,
+                    "--no-gpg-sign" => sign = false,
+                    a if a.starts_with("-S") => {
+                        sign = true;
+                        signing_path = Some(a[2..].into());
+                    }
+                    a if a.starts_with("--gpg-sign=") => {
+                        sign = true;
+                        signing_path = Some(a[11..].into());
+                    }
                     "--author" => {
                         i += 1;
                         author = Some(items.get(i).context("missing author")?.clone());
@@ -557,6 +572,15 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                 }
                 i += 1;
             }
+            let signing_key = if sign {
+                Some(crate::signing::key(cli, signing_path.as_deref().context("commit -S requires --signing-key PATH or SAFE_GIT_SIGNING_KEY; repository key settings are ignored")?)?)
+            } else {
+                None
+            };
+            ensure!(
+                !sign || !repo.exists("safe-git-sequence")?,
+                "finish the sequence before signing or amending with -S"
+            );
             if let Some(value) = fixup {
                 ensure!(!amend, "--fixup and --amend are incompatible");
                 let id = revision::commit(&repo, &mut store, value)?;
@@ -599,6 +623,7 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                     "commit requires -m or --amend --no-edit; editors are not implemented",
                 )?,
                 porcelain::CommitOptions {
+                    signing_key,
                     all,
                     quiet,
                     amend,
@@ -826,6 +851,15 @@ fn abbrev(store: &mut Store<'_>, id: Oid, length: usize) -> Result<String> {
     Ok(full[..length].to_owned())
 }
 pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Result<()> {
+    let mut normalized = Vec::new();
+    for item in items {
+        if item.starts_with("-M") && item != "-M" {
+            normalized.push(format!("--find-renames={}", &item[2..]));
+        } else {
+            normalized.push(item.clone());
+        }
+    }
+    let items = normalized.as_slice();
     let separator = items.iter().position(|a| a == "--").unwrap_or(items.len());
     let pos = args(
         &items[..separator],
@@ -843,6 +877,13 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
             "--name-only",
             "--name-status",
             "--check",
+            "-w",
+            "--ignore-all-space",
+            "-M",
+            "--find-renames",
+            "--find-renames=",
+            "--word-diff",
+            "--word-diff=",
         ],
     )?;
     let staged = porcelain::index(repo)?;
@@ -913,6 +954,36 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
         before.retain(keep);
         after.retain(keep);
     }
+    let ignore_space = flag(items, "-w") || flag(items, "--ignore-all-space");
+    let words = flag(items, "--word-diff") || option(items, "--word-diff=").is_some();
+    ensure!(
+        option(items, "--word-diff=").is_none_or(|v| v == "plain"),
+        "word diff supports plain output"
+    );
+    if ignore_space {
+        let mut equal = Vec::new();
+        let mut budget = 16 * 1024 * 1024;
+        for (path, a) in &before {
+            if let Some(b) = after
+                .get(path)
+                .filter(|b| b.mode == a.mode && b.oid != a.oid)
+            {
+                let old = crate::output::content(store, Some(*a), &mut budget)?;
+                let new = crate::output::content(store, Some(*b), &mut budget)?;
+                if !old.contains(&0)
+                    && !new.contains(&0)
+                    && crate::review::whitespace(&old) == crate::review::whitespace(&new)
+                {
+                    equal.push((path.clone(), *a));
+                }
+            }
+        }
+        after.extend(equal);
+    }
+    let renamed = match crate::review::rename_threshold(items)? {
+        Some(n) => crate::review::renames(store, &before, &after, n)?,
+        None => Vec::new(),
+    };
     let changed = before != after;
     let mut whitespace_errors = false;
     ensure!(
@@ -937,10 +1008,21 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
         let paths: BTreeSet<_> = before.keys().chain(after.keys()).collect();
         let mut budget = 16 * 1024 * 1024;
         let mut output = String::new();
-        for path in paths {
-            let a = before.get(path).copied();
+        let mut records = renamed
+            .iter()
+            .map(|(a, b, n)| (a.as_slice(), b.as_slice(), Some(*n)))
+            .collect::<Vec<_>>();
+        records.extend(
+            paths
+                .into_iter()
+                .filter(|p| !renamed.iter().any(|(a, b, _)| a == *p || b == *p))
+                .map(|p| (p.as_slice(), p.as_slice(), None)),
+        );
+        records.sort_by(|a, b| a.1.cmp(b.1));
+        for (old_path, path, rename) in records {
+            let a = before.get(old_path).copied();
             let b = after.get(path).copied();
-            if a == b {
+            if a == b && rename.is_none() {
                 continue;
             }
             if flag(items, "--check") {
@@ -952,6 +1034,14 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
                 continue;
             }
             if flag(items, "--name-status") {
+                if let Some(score) = rename {
+                    output.push_str(&format!(
+                        "R{score:03}\t{}\t{}\n",
+                        crate::output::quote(old_path),
+                        crate::output::quote(path)
+                    ));
+                    continue;
+                }
                 let status = match (a, b) {
                     (None, _) => 'A',
                     (_, None) => 'D',
@@ -969,12 +1059,19 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
                 continue;
             }
             let mut ap = b"a/".to_vec();
-            ap.extend_from_slice(path);
+            ap.extend_from_slice(old_path);
             let ap = crate::output::quote(&ap);
             let mut bp = b"b/".to_vec();
             bp.extend_from_slice(path);
             let bp = crate::output::quote(&bp);
             output.push_str(&format!("diff --git {ap} {bp}\n"));
+            if let Some(score) = rename {
+                output.push_str(&format!(
+                    "similarity index {score}%\nrename from {}\nrename to {}\n",
+                    crate::output::quote(old_path),
+                    crate::output::quote(path)
+                ));
+            }
             match (a, b) {
                 (None, Some(e)) => output.push_str(&format!("new file mode {:06o}\n", e.mode)),
                 (Some(e), None) => output.push_str(&format!("deleted file mode {:06o}\n", e.mode)),
@@ -1006,7 +1103,11 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
                 continue;
             }
             diff_budget(&old, &new)?;
-            let patch = diffy::create_patch_bytes(&old, &new).to_bytes();
+            let patch = if ignore_space {
+                crate::review::whitespace_patch(&old, &new)?
+            } else {
+                diffy::create_patch_bytes(&old, &new).to_bytes()
+            };
             let a_tab = if !ap.starts_with('"') && ap.contains(' ') {
                 "\t"
             } else {
@@ -1018,6 +1119,15 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
                 ""
             };
             output.push_str(&format!("--- {ap}{a_tab}\n+++ {bp}{b_tab}\n"));
+            if words {
+                output.push_str(&format!(
+                    "@@ -1,{} +1,{} @@\n",
+                    old.split_inclusive(|b| *b == b'\n').count(),
+                    new.split_inclusive(|b| *b == b'\n').count()
+                ));
+                output.push_str(&crate::review::word_diff(&old, &new)?);
+                continue;
+            }
             let mut lines = patch.split_inclusive(|b| *b == b'\n');
             lines.next();
             lines.next();
@@ -1090,7 +1200,10 @@ pub(crate) fn history(
             normalized.push(item.clone());
             continue;
         }
-        if item == "--author" || item == "--grep" {
+        if matches!(
+            item.as_str(),
+            "--author" | "--grep" | "--since" | "--after" | "--until" | "--before"
+        ) {
             normalized.push(format!(
                 "{item}={}",
                 input.next().context("missing search pattern")?
@@ -1114,6 +1227,13 @@ pub(crate) fn history(
         &items[..separator],
         &[
             "--count",
+            "-p",
+            "--patch",
+            "--follow",
+            "--since=",
+            "--after=",
+            "--until=",
+            "--before=",
             "--first-parent",
             "--oneline",
             "--color=",
@@ -1148,15 +1268,38 @@ pub(crate) fn history(
         flag(items, "--all"),
         flag(items, "--first-parent"),
     )?;
+    let mut commit_paths = HashMap::new();
     if separator < items.len() {
-        let specs = crate::workflow::paths(&items[separator + 1..], prefix)?;
+        let mut specs = crate::workflow::paths(&items[separator + 1..], prefix)?;
+        ensure!(
+            !flag(items, "--follow") || specs.len() == 1,
+            "--follow requires one path"
+        );
         let mut filtered = Vec::new();
         for id in ids {
             if crate::inspect::changed(store, id, &specs)? {
+                commit_paths.insert(id, specs.clone());
                 filtered.push(id);
+                if flag(items, "--follow")
+                    && let Some(parent) = store.parents(id)?.first().copied()
+                {
+                    let old = porcelain::tree(store, parent)?;
+                    let new = porcelain::tree(store, id)?;
+                    if let Some((a, _, _)) = crate::review::renames(store, &old, &new, 50)?
+                        .into_iter()
+                        .find(|(_, b, _)| *b == specs[0])
+                    {
+                        specs[0] = a;
+                    }
+                }
             }
         }
         ids = filtered;
+    } else {
+        ensure!(
+            !flag(items, "--follow"),
+            "--follow requires a path after --"
+        );
     }
     ensure!(
         !flag(items, "--reverse") || !flag(items, "--graph"),
@@ -1177,12 +1320,22 @@ pub(crate) fn history(
     let authors =
         crate::search::Matcher::new(&patterns("--author="), fixed, extended, insensitive)?;
     let messages = crate::search::Matcher::new(&patterns("--grep="), fixed, extended, insensitive)?;
+    let since = option(items, "--since=")
+        .or(option(items, "--after="))
+        .map(crate::review::since)
+        .transpose()?;
+    let until = option(items, "--until=")
+        .or(option(items, "--before="))
+        .map(crate::review::since)
+        .transpose()?;
     let mut filtered = Vec::new();
     for id in ids {
         let object = store.get(id)?;
         let author = porcelain::author(&object.data)?;
         let message = porcelain::message(&object.data)?;
-        if authors.matches(author.as_bytes())
+        if since.is_none_or(|n| timestamp(&object.data) >= n)
+            && until.is_none_or(|n| timestamp(&object.data) <= n)
+            && authors.matches(author.as_bytes())
             && if flag(items, "--all-match") {
                 messages.matches_all(message)
             } else {
@@ -1248,6 +1401,7 @@ pub(crate) fn history(
             if let Some(transition) = transition {
                 println!("{transition}");
             }
+            history_patch(repo, store, id, items, commit_paths.get(&id))?;
             continue;
         }
         let author = object
@@ -1333,6 +1487,7 @@ pub(crate) fn history(
             if let Some(transition) = transition {
                 println!("{transition}");
             }
+            history_patch(repo, store, id, items, commit_paths.get(&id))?;
             continue;
         }
         let date = time::OffsetDateTime::from_unix_timestamp(seconds)?;
@@ -1383,8 +1538,39 @@ pub(crate) fn history(
         {
             println!("{continuation}    {}", text(line));
         }
+        history_patch(repo, store, id, items, commit_paths.get(&id))?;
     }
     Ok(())
+}
+fn history_patch(
+    repo: &Repo,
+    store: &mut Store<'_>,
+    id: Oid,
+    items: &[String],
+    paths: Option<&Vec<Vec<u8>>>,
+) -> Result<()> {
+    if !flag(items, "-p") && !flag(items, "--patch") {
+        return Ok(());
+    }
+    let parents = store.parents(id)?;
+    if parents.len() > 1 {
+        return Ok(());
+    }
+    let mut args = vec![
+        parents
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or(revision::EMPTY_TREE.into()),
+        id.to_string(),
+    ];
+    if let Some(paths) = paths {
+        args.push("--".into());
+        for p in paths {
+            args.push(String::from_utf8(p.clone())?);
+        }
+    }
+    println!();
+    diff(repo, store, &args)
 }
 fn describe(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Result<()> {
     let mut filtered = Vec::new();

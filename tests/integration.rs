@@ -2,6 +2,8 @@
 //! temporary sshd's forced command, keeping the entire fixture in Rust.
 #[path = "suites/bootstrap.rs"]
 mod bootstrap;
+#[path = "suites/closure.rs"]
+mod closure;
 #[path = "suites/completion.rs"]
 mod completion;
 #[path = "suites/extended.rs"]
@@ -41,6 +43,34 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("closure_review", || {
+                closure::review();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("closure_interactive", || {
+                closure::interactive();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("closure_rebase", || {
+                closure::rebase();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("closure_maintenance_signing", || {
+                closure::maintenance_signing();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("closure_indexes", || {
+                closure::indexes();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("closure_mail_patches", || {
+                closure::mail_patches();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("closure_submodules", || {
+                closure::submodules();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("remaining_sparse", || {
                 remaining::sparse();
                 Ok(())

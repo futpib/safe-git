@@ -343,6 +343,9 @@ pub(crate) fn scan_untracked(
 }
 
 fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
+    if args.iter().any(|s| s == "-i" || s == "--interactive") {
+        return interactive_add(cli, repo, args);
+    }
     let mut intent = false;
     let mut patch = false;
     let (mut all, mut update, mut force, mut end) = (false, false, false, false);
@@ -449,6 +452,92 @@ fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
     unchanged(repo, &original, &head)?;
     lock.file.write_all(&encoded)?;
     lock.commit("index")
+}
+fn interactive_add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
+    let names = args
+        .iter()
+        .filter(|s| !matches!(s.as_str(), "-i" | "--interactive" | "--"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let specs = if names.is_empty() {
+        vec![Vec::new()]
+    } else {
+        paths(&names, &cli.prefix)?
+    };
+    let mut root_cli = cli.clone();
+    root_cli.prefix.clear();
+    loop {
+        let staged = porcelain::index(repo)?;
+        let work = checkout::snapshot(repo, &staged)?;
+        let mut changed: BTreeSet<_> = staged
+            .keys()
+            .chain(work.keys())
+            .filter(|p| staged.get(*p) != work.get(*p) && selected(p, &specs))
+            .cloned()
+            .collect();
+        changed.extend(untracked(repo, &staged, &specs, false)?);
+        let paths: Vec<_> = changed.into_iter().collect();
+        for (i, p) in paths.iter().enumerate() {
+            println!("{}: {}", i + 1, quote_path(p));
+        }
+        let action = crate::patch::input("[u]pdate, [r]evert staged, [p]atch, [q]uit: ")?;
+        if matches!(action.trim(), "q" | "quit" | "7") {
+            return Ok(());
+        }
+        let revert = matches!(action.trim(), "r" | "revert" | "3");
+        if !revert && !matches!(action.trim(), "u" | "update" | "2" | "p" | "patch" | "5") {
+            continue;
+        }
+        let candidates = if revert {
+            staged
+                .keys()
+                .filter(|p| selected(p, &specs))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            paths
+        };
+        if revert {
+            for (i, p) in candidates.iter().enumerate() {
+                println!("{}: {}", i + 1, quote_path(p));
+            }
+        }
+        let answer = crate::patch::input("Select file numbers (space separated, or *): ")?;
+        let selected = if answer.trim() == "*" {
+            candidates
+        } else {
+            answer
+                .split_whitespace()
+                .map(|v| {
+                    let n = v.parse::<usize>()?;
+                    candidates
+                        .get(n.checked_sub(1).context("file numbers start at 1")?)
+                        .cloned()
+                        .context("invalid file number")
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        if selected.is_empty() {
+            continue;
+        }
+        let patch = matches!(action.trim(), "p" | "patch" | "5");
+        let mut options: Vec<String> = if revert {
+            vec!["--staged".into()]
+        } else if patch {
+            vec!["--patch".into()]
+        } else {
+            Vec::new()
+        };
+        options.push("--".into());
+        for p in selected {
+            options.push(format!(":(literal){}", String::from_utf8(p)?));
+        }
+        if revert {
+            restore(&root_cli, repo, &mut Store::new(repo), &options)?;
+        } else {
+            add(&root_cli, repo, &options)?;
+        }
+    }
 }
 
 pub(crate) fn legacy_restore(

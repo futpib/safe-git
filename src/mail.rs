@@ -126,6 +126,7 @@ pub fn check_whitespace(path: &[u8], old: &[u8], new: &[u8]) -> Result<(bool, St
 }
 #[derive(Default, Clone)]
 struct Change {
+    copy: bool,
     old: Option<Vec<u8>>,
     new: Option<Vec<u8>>,
     old_mode: Option<u32>,
@@ -198,7 +199,7 @@ fn path(input: &[u8], strip: usize) -> Result<Option<Vec<u8>>> {
 fn mode(line: &[u8]) -> Result<u32> {
     let n = u32::from_str_radix(std::str::from_utf8(line)?.trim(), 8)?;
     ensure!(
-        matches!(n, 0o100644 | 0o100755 | 0o120000),
+        matches!(n, 0o100644 | 0o100755 | 0o120000 | 0o160000),
         "unsupported patch mode"
     );
     Ok(n)
@@ -258,6 +259,12 @@ fn parse(bytes: &[u8], strip: usize) -> Result<Vec<Change>> {
                 c.old_mode = Some(mode(v)?);
             } else if let Some(v) = line.strip_prefix(b"new mode ") {
                 c.new_mode = Some(mode(v)?);
+            } else if let Some(v) = line.strip_prefix(b"copy from ") {
+                c.copy = true;
+                c.old = path(v, 0)?;
+            } else if let Some(v) = line.strip_prefix(b"copy to ") {
+                c.copy = true;
+                c.new = path(v, 0)?;
             } else if let Some(v) = line.strip_prefix(b"rename from ") {
                 c.old = path(v, 0)?;
             } else if let Some(v) = line.strip_prefix(b"rename to ") {
@@ -333,10 +340,7 @@ fn parse(bytes: &[u8], strip: usize) -> Result<Vec<Change>> {
                     c.binary.push(crate::binary_patch::parse(&lines, &mut i)?);
                 }
                 continue;
-            } else if line.starts_with(b"Binary files")
-                || line.starts_with(b"copy from ")
-                || line.starts_with(b"copy to ")
-            {
+            } else if line.starts_with(b"Binary files") {
                 bail!("patch lacks applicable content or uses unsupported copy headers");
             } else if line.starts_with(b"-- ") {
                 break;
@@ -388,15 +392,13 @@ fn transform(
         }
         if let Some(p) = &c.new {
             ensure!(
-                c.old.as_ref() == Some(p) || !after.contains_key(p),
+                c.copy && reverse || c.old.as_ref() == Some(p) || !after.contains_key(p),
                 "patch would overwrite existing file"
             );
         }
         let old = match entry {
-            Some(e) => {
-                ensure!(e.mode != 0o160000, "gitlink patches are unsupported");
-                store.get(e.oid)?.data.clone()
-            }
+            Some(e) if e.mode == 0o160000 => format!("Subproject commit {}\n", e.oid).into_bytes(),
+            Some(e) => store.get(e.oid)?.data.clone(),
             None => Vec::new(),
         };
         if !c.binary.is_empty() {
@@ -441,7 +443,19 @@ fn transform(
         };
         total += data.len();
         ensure!(total <= LIMIT, "patch result exceeds byte limit");
-        if let Some(p) = &c.old {
+        if c.copy && reverse {
+            let source = original.old.as_ref().context("copy has no source")?;
+            let e = *before.get(source).context("copy source missing")?;
+            ensure!(
+                store.get(e.oid)?.data == data,
+                "reversed copy differs from source"
+            );
+            after.remove(c.old.as_ref().context("copy has no destination")?);
+            continue;
+        }
+        if !c.copy
+            && let Some(p) = &c.old
+        {
             after.remove(p);
         }
         if let Some(p) = c.new {
@@ -449,12 +463,21 @@ fn transform(
             if m == 0o120000 {
                 checkout::symlink_target(&p, &data)?;
             }
-            let obj = Object {
-                kind: Kind::Blob,
-                data,
+            let oid = if m == 0o160000 {
+                let value = data
+                    .strip_prefix(b"Subproject commit ")
+                    .and_then(|s| s.strip_suffix(b"\n"))
+                    .context("invalid gitlink patch")?;
+                Oid::parse(value)?
+            } else {
+                let obj = Object {
+                    kind: Kind::Blob,
+                    data,
+                };
+                let id = obj.oid()?;
+                repo.write_object(&obj)?;
+                id
             };
-            let oid = obj.oid()?;
-            repo.write_object(&obj)?;
             after.insert(
                 p,
                 Entry {
@@ -504,6 +527,9 @@ fn apply_changes(
             .iter()
             .flat_map(|c| c.old.iter().chain(c.new.iter()))
         {
+            if tracked.get(p).is_some_and(|e| e.mode == 0o160000) {
+                continue;
+            }
             if let Some(e) = work.state(p)? {
                 tracked.insert(p.clone(), e);
             }
@@ -649,10 +675,6 @@ fn patch_between(store: &mut Store<'_>, before: &Entries, after: &Entries) -> Re
         let old = crate::output::content(store, a, &mut budget)?;
         let new = crate::output::content(store, b, &mut budget)?;
 
-        ensure!(
-            !a.into_iter().chain(b).any(|e| e.mode == 0o160000),
-            "gitlink patches are unsupported"
-        );
         writeln!(
             out,
             "index {}..{}{}",
@@ -825,7 +847,10 @@ struct Letter {
     patch: Vec<u8>,
 }
 fn letters(bytes: &[u8]) -> Result<Vec<Letter>> {
-    let text = std::str::from_utf8(bytes).context("mailbox must be UTF-8 text")?;
+    let normalized = std::str::from_utf8(bytes)
+        .context("mailbox transport must be UTF-8 or MIME encoded")?
+        .replace("\r\n", "\n");
+    let text = normalized.as_str();
     let mut starts = Vec::new();
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
@@ -851,34 +876,11 @@ fn letters(bytes: &[u8]) -> Result<Vec<Letter>> {
             letter
         };
         let (headers, body) = letter.split_once("\n\n").context("missing mail headers")?;
-        let mut fields = std::collections::BTreeMap::<String, String>::new();
-        let mut last = String::new();
-        for line in headers.lines() {
-            if line.starts_with([' ', '\t']) {
-                let v = fields.get_mut(&last).context("bad folded header")?;
-                v.push(' ');
-                v.push_str(line.trim());
-            } else {
-                let (k, v) = line.split_once(':').context("bad email header")?;
-                last = k.to_ascii_lowercase();
-                ensure!(
-                    fields.insert(last.clone(), v.trim().into()).is_none(),
-                    "duplicate mail header"
-                );
-            }
-        }
+        let fields = crate::mime::headers(headers)?;
+        let body = crate::mime::body(&fields, body)?;
+        let who = crate::mime::header(fields.get("from").context("missing mail author")?)?;
         ensure!(
-            fields
-                .get("content-transfer-encoding")
-                .is_none_or(|v| matches!(v.as_str(), "8bit" | "7bit")),
-            "encoded mail bodies are unsupported"
-        );
-        let who = fields.get("from").context("missing mail author")?;
-        ensure!(
-            !who.contains("=?")
-                && !who.chars().any(char::is_control)
-                && who.ends_with('>')
-                && who.contains('<'),
+            !who.chars().any(char::is_control) && who.ends_with('>') && who.contains('<'),
             "invalid or encoded mail author"
         );
         let date = time::OffsetDateTime::parse(
@@ -892,11 +894,7 @@ fn letters(bytes: &[u8]) -> Result<Vec<Letter>> {
             seconds.abs() / 3600,
             seconds.abs() % 3600 / 60
         );
-        let subject = fields.get("subject").context("missing mail subject")?;
-        ensure!(
-            !subject.contains("=?"),
-            "encoded mail subjects are unsupported"
-        );
+        let subject = crate::mime::header(fields.get("subject").context("missing mail subject")?)?;
         let subject = if subject.starts_with("[PATCH") {
             subject
                 .split_once(']')

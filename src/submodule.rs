@@ -111,6 +111,22 @@ pub fn head(repo: &Repo, path: &[u8]) -> Result<Option<Oid>> {
     }
 }
 pub async fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Result<()> {
+    run_inner(cli, repo, store, args, 0, &mut 1024usize).await
+}
+async fn run_inner(
+    cli: &Cli,
+    repo: &Repo,
+    store: &mut Store<'_>,
+    args: &[String],
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<()> {
+    ensure!(
+        depth <= 32 && *remaining > 0,
+        "submodule recursion limit exceeded"
+    );
+    *remaining -= 1;
+    let mut recursive = false;
     let command = args.first().map(String::as_str).unwrap_or("status");
     let mut url = None;
     let mut force = false;
@@ -126,6 +142,7 @@ pub async fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String])
             "--" => end = true,
             "--url" => url = Some(items.next().context("missing submodule URL")?.clone()),
             "--init" | "--checkout" => {}
+            "--recursive" => recursive = true,
             "-f" | "--force" => force = true,
             a if a.starts_with('-') => bail!(
                 "unsupported submodule option {a}; recursive endpoints must be registered individually"
@@ -133,6 +150,10 @@ pub async fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String])
             _ => names.push(arg.clone()),
         }
     }
+    ensure!(
+        !recursive || matches!(command, "init" | "update" | "status"),
+        "--recursive supports init, update and status"
+    );
     let staged = porcelain::index(repo)?;
     let mut registered = registrations(repo)?;
     if command == "add" {
@@ -356,6 +377,38 @@ pub async fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String])
             _ => bail!(
                 "unsupported submodule command {command}; repository-selected commands are never run"
             ),
+        }
+        if recursive {
+            let sub = match child(repo, path) {
+                Ok(sub) => sub,
+                Err(e) if command == "status" || command == "init" => {
+                    let _ = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let mut sub_cli = cli.clone();
+            sub_cli.repository = std::fs::read_link(format!(
+                "/proc/self/fd/{}",
+                sub.worktree
+                    .as_ref()
+                    .context("submodule requires a working tree")?
+                    .as_raw_fd()
+            ))?;
+            sub_cli.prefix.clear();
+            let mut sub_args = vec![command.to_owned(), "--recursive".into()];
+            if force {
+                sub_args.push("--force".into());
+            }
+            Box::pin(run_inner(
+                &sub_cli,
+                &sub,
+                &mut Store::new(&sub),
+                &sub_args,
+                depth + 1,
+                remaining,
+            ))
+            .await?;
         }
     }
     Ok(())

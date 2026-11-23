@@ -5,6 +5,7 @@ mod checkout;
 mod clone;
 mod compat;
 mod config;
+mod extended_index;
 mod files;
 mod history;
 mod host_keys;
@@ -13,6 +14,8 @@ mod index;
 mod inspect;
 mod linked;
 mod mail;
+mod maintenance;
+mod mime;
 mod network;
 mod object;
 mod output;
@@ -26,10 +29,12 @@ mod push;
 mod rebase_plan;
 mod remotes;
 mod repo;
+mod review;
 mod revision;
 mod search;
 mod sequence;
 mod shallow;
+mod signing;
 mod sparse;
 mod ssh_config;
 mod stash;
@@ -47,7 +52,7 @@ use repo::{Repo, Store};
 use std::{path::PathBuf, time::Duration};
 use transport::Auth;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     version = env!("SAFE_GIT_VERSION"),
     about = "Git operations without repository-directed execution",
@@ -73,6 +78,9 @@ struct Cli {
     /// Caller-selected endpoint for fetch/pull/push without a positional URL
     #[arg(long = "url", global = true, env = "SAFE_GIT_URL")]
     remote_url: Option<String>,
+    /// Caller-selected OpenSSH key for commit -S; repository signing config is ignored
+    #[arg(long, global = true, env = "SAFE_GIT_SIGNING_KEY")]
+    signing_key: Option<String>,
     /// Trusted host-key file (defaults to ~/.ssh/known_hosts)
     #[arg(long, global = true)]
     known_hosts: Option<PathBuf>,
@@ -88,7 +96,7 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Command {
     /// Clone verified objects into a new or empty repository
     Clone {
