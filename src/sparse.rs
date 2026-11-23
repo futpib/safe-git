@@ -4,7 +4,6 @@ use crate::{
     checkout::{self, Edit, Work},
     config, ignore,
     index::{self, Entries},
-    object::Oid,
     porcelain,
     repo::{Pending, Repo, Store},
 };
@@ -229,7 +228,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
         store,
         Edit {
             head: repo.head()?,
-            tip: repo.read_ref("HEAD")?.unwrap_or(Oid::ZERO),
+            tip: repo.read_ref("HEAD")?.unwrap_or(repo.format.zero()),
             before,
             after,
             index_before,

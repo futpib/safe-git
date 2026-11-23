@@ -55,6 +55,7 @@ pub fn mode(mode: u32) -> Result<()> {
     Ok(())
 }
 pub fn tree(store: &mut impl ReadObjects, commit: Option<Oid>) -> Result<Entries> {
+    let hash_len = store.format().bytes();
     let mut entries = Entries::new();
     let Some(commit) = commit else {
         return Ok(entries);
@@ -99,8 +100,8 @@ pub fn tree(store: &mut impl ReadObjects, commit: Option<Oid>) -> Result<Entries
             }
             full.extend_from_slice(name);
             path(&full)?;
-            ensure!(rest.len() >= nul + 21, "truncated tree ID");
-            let id = Oid(rest[nul + 1..nul + 21].try_into()?);
+            ensure!(rest.len() >= nul + 1 + hash_len, "truncated tree ID");
+            let id = Oid::from_bytes(&rest[nul + 1..nul + 1 + hash_len])?;
             if mode == 0o40000 {
                 pending.push((full, id, depth + 1));
             } else {
@@ -120,7 +121,7 @@ pub fn tree(store: &mut impl ReadObjects, commit: Option<Oid>) -> Result<Entries
                     "duplicate tree path"
                 );
             }
-            data = &rest[nul + 21..];
+            data = &rest[nul + 1 + hash_len..];
         }
     }
     no_prefix_conflicts(&entries)?;
@@ -159,14 +160,15 @@ pub(crate) struct RawIndex {
     pub link: Option<Vec<u8>>,
     pub sparse: bool,
 }
-pub(crate) fn decode_raw(bytes: &[u8]) -> Result<RawIndex> {
+pub(crate) fn decode_raw(bytes: &[u8], format: object::Format) -> Result<RawIndex> {
+    let hash_len = format.bytes();
     ensure!(
-        bytes.len() >= 32 && &bytes[..4] == b"DIRC",
+        bytes.len() >= 12 + hash_len && &bytes[..4] == b"DIRC",
         "invalid Git index"
     );
-    let end = bytes.len() - 20;
+    let end = bytes.len() - hash_len;
     ensure!(
-        object::hash(&[&bytes[..end]])?.0 == bytes[end..],
+        object::hash_for(format, &[&bytes[..end]])?.0 == bytes[end..],
         "index checksum mismatch"
     );
     let version = u32::from_be_bytes(bytes[4..8].try_into()?);
@@ -179,14 +181,14 @@ pub(crate) fn decode_raw(bytes: &[u8]) -> Result<RawIndex> {
 
     for _ in 0..count {
         let start = pos;
-        ensure!(pos + 62 <= end, "truncated index entry");
+        ensure!(pos + 42 + hash_len <= end, "truncated index entry");
         let mode = u32::from_be_bytes(bytes[pos + 24..pos + 28].try_into()?);
         if mode != 0o40000 {
             self::mode(mode)?;
         }
-        let oid = Oid(bytes[pos + 40..pos + 60].try_into()?);
-        let flags = u16::from_be_bytes(bytes[pos + 60..pos + 62].try_into()?);
-        pos += 62;
+        let oid = Oid::from_bytes(&bytes[pos + 40..pos + 40 + hash_len])?;
+        let flags = u16::from_be_bytes(bytes[pos + 40 + hash_len..pos + 42 + hash_len].try_into()?);
+        pos += 42 + hash_len;
         let stage = (flags >> 12) & 3;
         ensure!(
             flags & 0x8000 == 0,
@@ -290,8 +292,12 @@ pub(crate) fn decode_raw(bytes: &[u8]) -> Result<RawIndex> {
         sparse,
     })
 }
+#[cfg(test)]
 pub fn encode(entries: &Entries) -> Result<Vec<u8>> {
-    encode_full(entries, &Conflicts::new())
+    encode_for(entries, object::Format::Sha1)
+}
+pub fn encode_for(entries: &Entries, format: object::Format) -> Result<Vec<u8>> {
+    encode_full_for(entries, &Conflicts::new(), format)
 }
 pub(crate) fn validate_conflicts(entries: &Entries, conflicts: &Conflicts) -> Result<()> {
     let mut paths = entries.clone();
@@ -305,7 +311,11 @@ pub(crate) fn validate_conflicts(entries: &Entries, conflicts: &Conflicts) -> Re
     }
     no_prefix_conflicts(&paths)
 }
-pub fn encode_full(entries: &Entries, conflicts: &Conflicts) -> Result<Vec<u8>> {
+pub fn encode_full_for(
+    entries: &Entries,
+    conflicts: &Conflicts,
+    format: object::Format,
+) -> Result<Vec<u8>> {
     validate_conflicts(entries, conflicts)?;
     ensure!(entries.len() <= MAX_OBJECTS, "index entry limit exceeded");
     no_prefix_conflicts(entries)?;
@@ -338,6 +348,7 @@ pub fn encode_full(entries: &Entries, conflicts: &Conflicts) -> Result<Vec<u8>> 
         out.extend_from_slice(&[0; 24]);
         out.extend_from_slice(&entry.mode.to_be_bytes());
         out.extend_from_slice(&[0; 12]);
+        ensure!(entry.oid.format() == format, "index object format differs");
         out.extend_from_slice(&entry.oid.0);
         ensure!(
             entry.flags & !(INTENT | SKIP) == 0
@@ -358,7 +369,7 @@ pub fn encode_full(entries: &Entries, conflicts: &Conflicts) -> Result<Vec<u8>> 
             out.push(0);
         }
     }
-    out.extend_from_slice(&object::hash(&[&out])?.0);
+    out.extend_from_slice(&object::hash_for(format, &[&out])?.0);
     Ok(out)
 }
 
@@ -372,7 +383,7 @@ mod tests {
                 b"file".to_vec(),
                 Entry {
                     mode: 0o100644,
-                    oid: Oid([1; 20]),
+                    oid: Oid::sha1([1; 20]),
                     flags,
                 },
             )]);
@@ -410,7 +421,7 @@ mod tests {
             b"src/main.rs".to_vec(),
             Entry {
                 mode: 0o100644,
-                oid: Oid([1; 20]),
+                oid: Oid::sha1([1; 20]),
                 flags: 0,
             },
         );

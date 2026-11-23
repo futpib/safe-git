@@ -96,7 +96,7 @@ fn show_commit(
             parents
                 .first()
                 .map(ToString::to_string)
-                .unwrap_or(revision::EMPTY_TREE.into()),
+                .unwrap_or(repo.format.empty_tree()?.to_string()),
             id.to_string(),
         ];
         if stat {
@@ -379,7 +379,7 @@ fn blame(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Resu
             .checked_sub(unresolved.len())
             .context("blame line traversal exceeds limit")?;
         ensure!(steps <= MAX_OBJECTS, "blame traversal limit exceeded");
-        let (current, parents) = if commit == Oid::ZERO {
+        let (current, parents) = if commit.is_zero() {
             (store.get(actual.oid)?, vec![id])
         } else {
             let tree = porcelain::tree(store, commit)?;
@@ -465,7 +465,7 @@ fn blame(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Resu
     );
     for n in start - 1..end {
         let (owner, line) = owners[n];
-        let (author, subject) = if owner == Oid::ZERO {
+        let (author, subject) = if owner.is_zero() {
             (
                 "Not Committed Yet <not.committed.yet> 0 +0000".into(),
                 "Version of file from working tree".into(),

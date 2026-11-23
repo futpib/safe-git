@@ -13,27 +13,10 @@ const LOG: &str = "logs/refs/stash";
 const LIMIT: usize = 8 * 1024 * 1024;
 
 fn stack(repo: &Repo) -> Result<Vec<Vec<u8>>> {
-    let data = repo.read(LOG, LIMIT)?.unwrap_or_default();
-    let lines: Vec<_> = data
-        .split_inclusive(|b| *b == b'\n')
-        .map(Vec::from)
-        .collect();
-    ensure!(lines.len() <= 10000, "stash entry limit exceeded");
-    for line in &lines {
-        ensure!(
-            line.len() >= 84
-                && line[40] == b' '
-                && line[81] == b' '
-                && line.ends_with(b"\n")
-                && line.contains(&b'\t'),
-            "invalid stash reflog"
-        );
-        Oid::parse(&line[..40])?;
-        Oid::parse(&line[41..81])?;
-    }
+    let lines = crate::history::log_entries(repo, "refs/stash")?;
     if let Some(last) = lines.last() {
         ensure!(
-            repo.read_ref("refs/stash")? == Some(Oid::parse(&last[41..81])?),
+            repo.read_ref("refs/stash")? == Some(crate::history::log_ids(last)?.1),
             "stash ref and reflog disagree"
         );
     } else {
@@ -59,7 +42,7 @@ fn record(
     bytes.extend_from_slice(
         format!(
             "{} {new} {identity}\t{message}\n",
-            previous.unwrap_or(Oid::ZERO)
+            previous.unwrap_or(repo.format.zero())
         )
         .as_bytes(),
     );
@@ -73,22 +56,26 @@ fn record(
 fn drop_entry(repo: &Repo, expected: Oid, selection: usize) -> Result<()> {
     let mut lines = stack(repo)?;
     ensure!(selection < lines.len(), "stash entry does not exist");
-    let old_top = Oid::parse(&lines.last().unwrap()[41..81])?;
+    let old_top = crate::history::log_ids(lines.last().unwrap())?.1;
     let top = lines.remove(lines.len() - 1 - selection);
-    let mut previous = Oid::ZERO;
+    let mut previous = repo.format.zero();
     for line in &mut lines {
-        line[..40].copy_from_slice(previous.to_string().as_bytes());
-        previous = Oid::parse(&line[41..81])?;
+        line[..repo.format.hex_len()].copy_from_slice(previous.to_string().as_bytes());
+        previous = crate::history::log_ids(line)?.1;
     }
     ensure!(
-        Oid::parse(&top[41..81])? == expected,
+        crate::history::log_ids(&top)?.1 == expected,
         "stash changed concurrently"
     );
     let (dir, name) = repo.parent(LOG, true)?;
     let mut log = Pending::new(dir, format!("{name}.lock"))?;
     log.file.write_all(&lines.concat())?;
     if let Some(last) = lines.last() {
-        repo.update_ref("refs/stash", Some(old_top), Oid::parse(&last[41..81])?)?;
+        repo.update_ref(
+            "refs/stash",
+            Some(old_top),
+            crate::history::log_ids(last)?.1,
+        )?;
     } else {
         repo.delete_ref("refs/stash", old_top)?;
     }
@@ -178,7 +165,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                         crate::index::Entry {
                             flags: 0,
                             mode: 0o100644,
-                            oid: Oid::ZERO,
+                            oid: repo.format.zero(),
                         },
                     );
                 }
@@ -321,7 +308,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                 .rev()
                 .nth(selection)
                 .context("stash entry does not exist")?;
-            let saved = Oid::parse(&last[41..81])?;
+            let saved = crate::history::log_ids(last)?.1;
             let parents = store.get(saved)?.commit()?.1;
             ensure!((2..=3).contains(&parents.len()), "invalid stash parents");
             let base = porcelain::tree(store, parents[0])?;
@@ -412,7 +399,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                 .rev()
                 .nth(selection)
                 .context("stash entry does not exist")?;
-            let saved = Oid::parse(&line[41..81])?;
+            let saved = crate::history::log_ids(line)?.1;
             let base = *store
                 .get(saved)?
                 .commit()?
@@ -447,7 +434,7 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                 .rev()
                 .nth(selection)
                 .context("stash entry does not exist")?;
-            drop_entry(repo, Oid::parse(&last[41..81])?, selection)
+            drop_entry(repo, crate::history::log_ids(last)?.1, selection)
         }
         _ => bail!("unsupported stash command {command}"),
     }

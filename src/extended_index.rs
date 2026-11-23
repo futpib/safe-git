@@ -86,22 +86,24 @@ fn ordered(records: &Records) -> Result<()> {
     Ok(())
 }
 pub fn decode(repo: Option<&Repo>, bytes: &[u8]) -> Result<(Entries, Conflicts)> {
-    let mut raw = index::decode_raw(bytes)?;
+    let format = repo.map(|r| r.format).unwrap_or_default();
+    let hash_len = format.bytes();
+    let mut raw = index::decode_raw(bytes, format)?;
     if let Some(link) = &raw.link {
         let repo = repo.context("split index requires repository context")?;
-        ensure!(link.len() >= 20, "truncated split index link");
-        let id = Oid(link[..20].try_into()?);
-        let base = if id == Oid::ZERO {
+        ensure!(link.len() >= hash_len, "truncated split index link");
+        let id = Oid::from_bytes(&link[..hash_len])?;
+        let base = if id.is_zero() {
             Vec::new()
         } else {
             let data = repo
                 .read(&format!("sharedindex.{id}"), crate::checkout::INDEX_LIMIT)?
                 .context("missing shared index")?;
             ensure!(
-                data.len() >= 20 && data[data.len() - 20..] == id.0,
+                data.len() >= hash_len && data[data.len() - hash_len..] == id.0,
                 "shared index hash mismatch"
             );
-            let base = index::decode_raw(&data)?;
+            let base = index::decode_raw(&data, format)?;
             ensure!(
                 base.link.is_none() && !base.sparse,
                 "nested split indexes are invalid"
@@ -109,8 +111,8 @@ pub fn decode(repo: Option<&Repo>, bytes: &[u8]) -> Result<(Entries, Conflicts)>
             ordered(&base.records)?;
             base.records
         };
-        let mut pos = 20;
-        let (deleted, replaced) = if link.len() == 20 {
+        let mut pos = hash_len;
+        let (deleted, replaced) = if link.len() == hash_len {
             (BTreeSet::new(), BTreeSet::new())
         } else {
             (

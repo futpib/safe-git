@@ -97,9 +97,14 @@ struct Delta {
     data: Vec<u8>,
 }
 
+#[cfg(test)]
 pub fn decode(data: &[u8]) -> Result<Objects> {
+    decode_for(data, object::Format::Sha1)
+}
+pub fn decode_for(data: &[u8], format: object::Format) -> Result<Objects> {
+    let hash_len = format.bytes();
     ensure!(
-        (32..=MAX_PACK).contains(&data.len()),
+        (12 + hash_len..=MAX_PACK).contains(&data.len()),
         "pack size outside limits"
     );
     ensure!(&data[..4] == b"PACK", "missing PACK signature");
@@ -107,9 +112,9 @@ pub fn decode(data: &[u8]) -> Result<Objects> {
     ensure!(version == 2 || version == 3, "unsupported pack version");
     let count = u32::from_be_bytes(data[8..12].try_into()?) as usize;
     ensure!(count <= MAX_OBJECTS, "pack object count exceeds limit");
-    let payload_end = data.len() - 20;
+    let payload_end = data.len() - hash_len;
     ensure!(
-        object::hash(&[&data[..payload_end]])?.0 == data[payload_end..],
+        object::hash_for(format, &[&data[..payload_end]])?.0 == data[payload_end..],
         "pack checksum mismatch"
     );
     let data = &data[..payload_end];
@@ -150,9 +155,9 @@ pub fn decode(data: &[u8]) -> Result<Objects> {
                 Some(Base::Offset(offset - back))
             }
             7 => {
-                ensure!(pos + 20 <= data.len(), "truncated delta base ID");
-                let id = Oid(data[pos..pos + 20].try_into()?);
-                pos += 20;
+                ensure!(pos + hash_len <= data.len(), "truncated delta base ID");
+                let id = Oid::from_bytes(&data[pos..pos + hash_len])?;
+                pos += hash_len;
                 Some(Base::Id(id))
             }
             _ => {
@@ -177,7 +182,7 @@ pub fn decode(data: &[u8]) -> Result<Objects> {
                 kind: Kind::from_number(kind)?,
                 data: body,
             });
-            let id = object.oid()?;
+            let id = object.oid_for(format)?;
             offsets.insert(offset, id);
             depths.insert(id, 0usize);
             objects.insert(id, object);
@@ -208,7 +213,7 @@ pub fn decode(data: &[u8]) -> Result<Objects> {
                     kind: base.kind,
                     data: body,
                 });
-                let id = object.oid()?;
+                let id = object.oid_for(format)?;
                 offsets.insert(delta.offset, id);
                 depths.insert(id, depth);
                 objects.insert(id, object);
@@ -227,10 +232,18 @@ pub fn decode(data: &[u8]) -> Result<Objects> {
     Ok(objects)
 }
 
+#[cfg(test)]
 pub fn encode(objects: &[Arc<Object>]) -> Result<Vec<u8>> {
-    Ok(encode_indexed(objects, false)?.0)
+    encode_for(objects, object::Format::Sha1)
 }
-pub fn encode_indexed(objects: &[Arc<Object>], indexed: bool) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn encode_for(objects: &[Arc<Object>], format: object::Format) -> Result<Vec<u8>> {
+    Ok(encode_indexed_for(objects, false, format)?.0)
+}
+pub fn encode_indexed_for(
+    objects: &[Arc<Object>],
+    indexed: bool,
+    format: object::Format,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     ensure!(objects.len() <= MAX_OBJECTS, "too many objects to push");
     let mut pack = Vec::from(&b"PACK\0\0\0\x02"[..]);
     pack.extend_from_slice(&(objects.len() as u32).to_be_bytes());
@@ -255,14 +268,17 @@ pub fn encode_indexed(objects: &[Arc<Object>], indexed: bool) -> Result<(Vec<u8>
         let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
         z.write_all(&obj.data)?;
         pack.extend(z.finish()?);
-        ensure!(pack.len() + 20 <= MAX_PACK, "outgoing pack exceeds limit");
+        ensure!(
+            pack.len() + format.bytes() <= MAX_PACK,
+            "outgoing pack exceeds limit"
+        );
         if indexed {
             let mut crc = flate2::Crc::new();
             crc.update(&pack[offset..]);
-            records.push((obj.oid()?, crc.sum(), u32::try_from(offset)?));
+            records.push((obj.oid_for(format)?, crc.sum(), u32::try_from(offset)?));
         }
     }
-    let checksum = object::hash(&[&pack])?;
+    let checksum = object::hash_for(format, &[&pack])?;
     pack.extend(checksum.0);
     let mut index = Vec::new();
     if indexed {
@@ -292,7 +308,7 @@ pub fn encode_indexed(objects: &[Arc<Object>], indexed: bool) -> Result<(Vec<u8>
             index.extend_from_slice(&offset.to_be_bytes());
         }
         index.extend_from_slice(&checksum.0);
-        index.extend_from_slice(&object::hash(&[&index])?.0);
+        index.extend_from_slice(&object::hash_for(format, &[&index])?.0);
     }
     Ok((pack, index))
 }
@@ -315,6 +331,22 @@ mod tests {
             bytes.extend(entry);
             bytes.extend(object::hash(&[&bytes]).unwrap().0);
             assert!(decode(&bytes).is_err());
+        }
+    }
+    #[test]
+    fn sha256_pack_boundaries() {
+        let format = object::Format::Sha256;
+        let empty = encode_for(&[], format).unwrap();
+        assert!(decode_for(&empty, format).unwrap().is_empty());
+        assert!(decode_for(&empty, object::Format::Sha1).is_err());
+        for n in 0..empty.len() {
+            assert!(decode_for(&empty[..n], format).is_err());
+        }
+        for entry in [vec![0x70, 1, 2, 3], vec![0x60, 0], vec![0xb0; 12]] {
+            let mut data = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+            data.extend(entry);
+            data.extend(object::hash_for(format, &[&data]).unwrap().0);
+            assert!(decode_for(&data, format).is_err());
         }
     }
     #[test]

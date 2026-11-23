@@ -127,8 +127,10 @@ enum Command {
         url: String,
         path: Option<PathBuf>,
     },
-    /// Create a new SHA-1 repository
+    /// Create a new repository
     Init {
+        #[arg(long, default_value = "sha1", value_parser = ["sha1", "sha256"])]
+        object_format: String,
         #[arg(long)]
         bare: bool,
         #[arg(short = 'b', long, default_value = "main")]
@@ -293,16 +295,19 @@ async fn run(cli: &Cli) -> Result<()> {
         path,
         initial_branch,
         bare,
+        object_format,
     } = &cli.command
     {
         let path = cli.repository.join(path);
         if *bare {
             Repo::init(&path, initial_branch)?;
+            Repo::open(&path)?.set_format(object::Format::parse(object_format)?)?;
         } else {
             if !path.exists() {
                 std::fs::create_dir(&path)?;
             }
-            Repo::init_worktree(&path, initial_branch)?;
+            Repo::init_worktree(&path, initial_branch)?
+                .set_format(object::Format::parse(object_format)?)?;
         }
         if !cli.quiet {
             println!(
@@ -352,6 +357,7 @@ async fn run(cli: &Cli) -> Result<()> {
                     &cli.repository,
                 )?;
                 let ad = network::discover(&endpoint, &cli.auth()?).await?;
+                ensure!(ad.format() == repo.format, "fetch object format mismatch");
                 let refs = ad
                     .refs
                     .into_iter()
@@ -553,6 +559,7 @@ async fn fetch(
     let endpoint = trust::endpoint(repo, url, cli.remote_url.as_deref())?;
     let endpoint = network::normalize_from(&endpoint, &cli.repository)?;
     let ad = network::discover(&endpoint, &cli.auth()?).await?;
+    ensure!(ad.format() == repo.format, "fetch object format mismatch");
     let tip = ad.branch(&branch).context("remote branch does not exist")?;
     let binding = trust::selected(repo, url)?;
     let filter = binding.filter(|b| b.url == endpoint).and_then(|b| b.filter);

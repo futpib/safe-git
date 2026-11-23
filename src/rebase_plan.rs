@@ -164,7 +164,7 @@ pub fn interactive(steps: Vec<Step>, initial: &BTreeMap<String, Oid>) -> Result<
         };
         let matches: Vec<_> = steps
             .iter()
-            .filter(|s| s.id != Oid::ZERO && id.len() >= 4 && s.id.to_string().starts_with(id))
+            .filter(|s| !s.id.is_zero() && id.len() >= 4 && s.id.to_string().starts_with(id))
             .collect();
         ensure!(matches.len() == 1, "unknown or ambiguous plan commit");
         let mut step = matches[0].clone();

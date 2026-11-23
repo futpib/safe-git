@@ -43,6 +43,18 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("closure_sha256_ssh_native", || {
+                closure::sha256_ssh_native();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("closure_sha256_workflows", || {
+                closure::sha256_workflows();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("closure_sha256_storage_transport", || {
+                closure::sha256_storage_transport();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("closure_review", || {
                 closure::review();
                 Ok(())

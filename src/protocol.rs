@@ -1,5 +1,5 @@
 use crate::{
-    object::{Objects, Oid},
+    object::{Format, Objects, Oid},
     pack, repo,
     transport::{self, Auth, Remote, Wire},
 };
@@ -7,15 +7,28 @@ use anyhow::{Context, Result, ensure};
 use std::collections::{HashMap, HashSet};
 
 pub struct Advertisement {
+    object_format: Option<Format>,
     pub refs: HashMap<String, Oid>,
     pub(crate) caps: HashSet<String>,
 }
 impl Advertisement {
     pub(crate) fn new() -> Self {
         Self {
+            object_format: None,
             refs: HashMap::new(),
             caps: HashSet::new(),
         }
+    }
+    pub fn format(&self) -> Format {
+        self.object_format.unwrap_or_default()
+    }
+    pub(crate) fn set_format(&mut self, format: Format) -> Result<()> {
+        ensure!(
+            self.object_format.is_none_or(|old| old == format),
+            "conflicting object formats"
+        );
+        self.object_format = Some(format);
+        Ok(())
     }
     pub(crate) fn line(&mut self, bytes: &[u8], first: bool) -> Result<()> {
         let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
@@ -27,26 +40,26 @@ impl Advertisement {
                 "invalid capabilities"
             );
             for cap in caps.split(' ').filter(|c| !c.is_empty()) {
-                ensure!(
-                    !cap.starts_with("object-format=") || cap == "object-format=sha1",
-                    "only SHA-1 repositories are supported"
-                );
+                if let Some(value) = cap.strip_prefix("object-format=") {
+                    self.set_format(Format::parse(value)?)?;
+                }
                 self.caps.insert(cap.to_owned());
             }
             &bytes[..nul]
         } else {
             bytes
         };
-        ensure!(
-            line.len() > 41 && line[40] == b' ',
-            "invalid ref advertisement"
-        );
-        let id = Oid::parse(&line[..40])?;
-        let name = std::str::from_utf8(&line[41..])?;
-        if id == Oid::ZERO && name == "capabilities^{}" && first {
+        let space = line
+            .iter()
+            .position(|b| *b == b' ')
+            .context("invalid ref advertisement")?;
+        let id = Oid::parse(&line[..space])?;
+        self.set_format(id.format())?;
+        let name = std::str::from_utf8(&line[space + 1..])?;
+        if id.is_zero() && name == "capabilities^{}" && first {
             return Ok(());
         }
-        ensure!(id != Oid::ZERO, "zero object ID in advertised ref");
+        ensure!(!id.is_zero(), "zero object ID in advertised ref");
         // receive-pack advertises objects from shared storage / other namespaces
         // as repeatable .have hints. They are not refs and never select a branch.
         // We do not use these optional hints to omit objects from a push.
@@ -146,7 +159,19 @@ pub(crate) fn request_options(
         !tips.is_empty() && tips.len() <= 100_000,
         "invalid want count"
     );
-    let mut caps = String::new();
+    let format = ad.format();
+    ensure!(
+        tips.iter()
+            .chain(haves)
+            .chain(&options.shallow)
+            .all(|id| id.format() == format),
+        "fetch object format mismatch"
+    );
+    let mut caps = if format == Format::Sha256 {
+        " object-format=sha256".to_owned()
+    } else {
+        String::new()
+    };
     for capability in ["ofs-delta", "no-progress"] {
         if ad.caps.contains(capability) {
             caps.push(' ');
@@ -207,7 +232,7 @@ pub(crate) fn check_ack(response: &[u8], haves: &[Oid]) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn decode_pack(bytes: &[u8], haves: &[Oid]) -> Result<Objects> {
+pub(crate) fn decode_pack(bytes: &[u8], haves: &[Oid], format: Format) -> Result<Objects> {
     // Git can acknowledge another offered commit after initially acknowledging
     // the wanted tip, even without multi_ack. Only accept our exact offered IDs.
     let mut rest = bytes;
@@ -237,7 +262,7 @@ pub(crate) fn decode_pack(bytes: &[u8], haves: &[Oid]) -> Result<Objects> {
         );
         rest = &rest[size..];
     }
-    pack::decode(rest)
+    pack::decode_for(rest, format)
 }
 
 /// Read refs without requesting objects or running a local helper.
@@ -273,30 +298,36 @@ pub(crate) fn push_request(
     );
     let mut request = Vec::new();
     let mut names = HashSet::new();
+    let format = ad.format();
     for (i, update) in updates.iter().enumerate() {
         repo::refname(&update.name)?;
+        ensure!(
+            update.new.format() == format && update.old.is_none_or(|id| id.format() == format),
+            "push object format mismatch"
+        );
         ensure!(names.insert(&update.name), "duplicate push destination");
         ensure!(
             ad.refs.get(&update.name).copied() == update.old,
             "push rejected: destination changed while preparing transfer; retry"
         );
         ensure!(
-            update.new != Oid::ZERO || ad.caps.contains("delete-refs"),
+            !update.new.is_zero() || ad.caps.contains("delete-refs"),
             "server does not allow deletion"
         );
-        let caps = if i == 0 {
+        let mut caps = String::new();
+        if i == 0 {
+            caps.push_str("\0report-status");
             if atomic {
-                "\0report-status atomic"
-            } else {
-                "\0report-status"
+                caps.push_str(" atomic");
             }
-        } else {
-            ""
-        };
+            if format == Format::Sha256 {
+                caps.push_str(" object-format=sha256");
+            }
+        }
         request.extend(transport::packet(
             format!(
                 "{} {} {}{caps}\n",
-                update.old.unwrap_or(Oid::ZERO),
+                update.old.unwrap_or(format.zero()),
                 update.new,
                 update.name
             )
@@ -417,7 +448,7 @@ pub async fn fetch_options(
         haves,
     )?;
     Ok(crate::network::Fetched {
-        objects: decode_pack(&wire.remainder().await?, haves)?,
+        objects: decode_pack(&wire.remainder().await?, haves, ad.format())?,
         shallow,
     })
 }
@@ -463,7 +494,7 @@ mod tests {
         let updates = vec![RefUpdate {
             name: "refs/heads/main".into(),
             old: None,
-            new: Oid([1; 20]),
+            new: Oid::sha1([1; 20]),
         }];
         assert!(push_request(&ad, &updates, true).is_err());
         ad.caps.extend(["atomic".into(), "report-status".into()]);
@@ -473,7 +504,7 @@ mod tests {
                 .windows(b"report-status atomic".len())
                 .any(|w| w == b"report-status atomic")
         );
-        ad.refs.insert("refs/heads/main".into(), Oid([2; 20]));
+        ad.refs.insert("refs/heads/main".into(), Oid::sha1([2; 20]));
         assert!(push_request(&ad, &updates, true).is_err());
         let mut remaining = HashSet::from(["refs/heads/main"]);
         assert!(push_status(b"ok refs/heads/other\n", &mut remaining).is_err());
@@ -539,6 +570,48 @@ mod tests {
             Oid::parse(b"2222222222222222222222222222222222222222").unwrap(),
         );
         assert!(ad.clone_branch(None).is_err());
+    }
+    #[test]
+    fn object_formats_are_consistent_through_negotiation() {
+        let id = "1".repeat(64);
+        let mut ad = Advertisement::new();
+        ad.line(
+            format!("{id} refs/heads/main\0object-format=sha256 report-status\n").as_bytes(),
+            true,
+        )
+        .unwrap();
+        let id = Oid::parse(id.as_bytes()).unwrap();
+        assert_eq!(ad.format(), Format::Sha256);
+        assert!(
+            ad.line(
+                b"1111111111111111111111111111111111111111 refs/heads/other",
+                false
+            )
+            .is_err()
+        );
+        assert!(request_options(&ad, &[id], &[Oid::sha1([1; 20])], &Default::default()).is_err());
+        assert!(
+            push_request(
+                &ad,
+                &[RefUpdate {
+                    name: "refs/heads/new".into(),
+                    old: None,
+                    new: Oid::sha1([1; 20])
+                }],
+                false
+            )
+            .is_err()
+        );
+        for caps in [
+            "object-format=sha1 object-format=sha256",
+            "object-format=unknown",
+        ] {
+            assert!(
+                Advertisement::new()
+                    .line(format!("{id} HEAD\0{caps}").as_bytes(), true)
+                    .is_err()
+            );
+        }
     }
     #[test]
     fn advertisement_validation() {

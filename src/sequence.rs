@@ -179,7 +179,7 @@ fn merge_trees(
                     kind: Kind::Blob,
                     data,
                 };
-                let oid = object.oid()?;
+                let oid = object.oid_for(repo.format)?;
                 repo.write_object(&object)?;
                 if let Some(entry) = &mut actual {
                     entry.oid = oid;
@@ -386,7 +386,7 @@ fn advance(cli: &Cli, repo: &Repo, store: &mut Store<'_>, state: &mut State) -> 
             } else {
                 parents.first().copied().unwrap_or(Oid::ZERO)
             };
-            let prior = if parent == Oid::ZERO {
+            let prior = if parent.is_zero() {
                 Entries::new()
             } else {
                 porcelain::tree(store, parent)?

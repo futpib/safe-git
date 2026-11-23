@@ -53,8 +53,27 @@ pub async fn advertisement(
         }
     } else {
         let id = Oid::parse(head.as_bytes())?;
-        ensure!(id != Oid::ZERO, "zero static HEAD");
+        ensure!(!id.is_zero(), "zero static HEAD");
+        ad.set_format(id.format())?;
         ad.refs.insert("HEAD".into(), id);
+    }
+    // An unborn static repository has no IDs from which to infer the format.
+    // Only this fixed file's inert format value is read; paths/includes stay data.
+    if ad.refs.is_empty() {
+        if let Some(config) = get(client, base, "config", 8 * 1024 * 1024).await? {
+            let values = crate::config::parse(&config)?;
+            let format = crate::object::Format::parse(
+                values
+                    .get("extensions.objectformat")
+                    .map(String::as_str)
+                    .unwrap_or("sha1"),
+            )?;
+            ad.set_format(format)?;
+        } else {
+            anyhow::bail!(
+                "empty static repository requires published config to determine object format"
+            );
+        }
     }
     Ok(ad)
 }
@@ -93,7 +112,10 @@ pub async fn fetch(
                 transferred += bytes.len();
                 ensure!(transferred <= MAX_TOTAL, "static transfer exceeds limit");
                 let obj = crate::repo::loose(&bytes)?;
-                ensure!(obj.oid()? == id, "static object checksum mismatch");
+                ensure!(
+                    obj.oid_for(id.format())? == id,
+                    "static object checksum mismatch"
+                );
                 inflated += obj.data.len();
                 entry.insert(std::sync::Arc::new(obj));
             } else if !packs_loaded {
@@ -126,10 +148,12 @@ pub async fn fetch(
                     transferred += bytes.len();
                     ensure!(transferred <= MAX_TOTAL, "static transfer exceeds limit");
                     ensure!(
-                        bytes.len() >= 20 && bytes[bytes.len() - 20..] == hash.0,
+                        hash.format() == id.format()
+                            && bytes.len() >= hash.format().bytes()
+                            && bytes[bytes.len() - hash.format().bytes()..] == hash.0,
                         "static pack name disagrees with checksum"
                     );
-                    for (id, obj) in crate::pack::decode(&bytes)? {
+                    for (id, obj) in crate::pack::decode_for(&bytes, hash.format())? {
                         if let std::collections::hash_map::Entry::Vacant(entry) = objects.entry(id)
                         {
                             inflated += obj.data.len();
@@ -156,7 +180,7 @@ pub async fn fetch(
         );
         if visited.insert(id) {
             pending.extend(
-                obj.children()?
+                obj.children_for(id.format())?
                     .into_iter()
                     .map(|(id, kind)| (id, Some(kind))),
             );

@@ -3,7 +3,6 @@ use crate::{
     Cli,
     checkout::{self, Edit, Work},
     index::{self, Entries},
-    object::Oid,
     porcelain,
     repo::{Pending, Repo, Store},
     workflow,
@@ -254,7 +253,8 @@ pub fn run(
                 porcelain::index(repo)? == staged,
                 "index changed concurrently"
             );
-            lock.file.write_all(&index::encode(&next)?)?;
+            lock.file
+                .write_all(&index::encode_for(&next, repo.format)?)?;
             lock.commit("index")?;
         } else {
             checkout::edit(
@@ -262,7 +262,7 @@ pub fn run(
                 store,
                 Edit {
                     head: repo.head()?,
-                    tip: repo.read_ref("HEAD")?.unwrap_or(Oid::ZERO),
+                    tip: repo.read_ref("HEAD")?.unwrap_or(repo.format.zero()),
                     before: actual,
                     after,
                     index_before: staged,

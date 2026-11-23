@@ -37,7 +37,13 @@ pub fn commit(
         .context("invalid commit")?;
     let mut data = object.data[..end + 1].to_vec();
     for (i, line) in signature.lines().enumerate() {
-        data.extend_from_slice(if i == 0 { b"gpgsig " } else { b" " });
+        data.extend_from_slice(if i != 0 {
+            b" "
+        } else if repo.format == crate::object::Format::Sha256 {
+            b"gpgsig-sha256 "
+        } else {
+            b"gpgsig "
+        });
         data.extend_from_slice(line.as_bytes());
         data.push(b'\n');
     }
@@ -47,5 +53,5 @@ pub fn commit(
         data,
     };
     repo.write_object(&signed)?;
-    signed.oid()
+    signed.oid_for(repo.format)
 }

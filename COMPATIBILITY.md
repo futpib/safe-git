@@ -1,5 +1,8 @@
 # Git compatibility
 
+SHA-1 and SHA-256 repositories are supported; `init --object-format=sha256`
+selects SHA-256, and clone preserves the advertised format. Mixed formats are rejected.
+
 Everyday editing includes init, clone/fetch/pull/push, branches, switch, status,
 add/restore (including interactive file selection and split/edited hunks), rm/mv/clean, commit/amend, reset, reflog,
 and stash. Directory moves preserve untracked files and unstaged edits; clean
@@ -39,6 +42,7 @@ Push supports SSH/HTTP(S), git://, local paths/file://, branches/tags, deletion,
 explicit force, and force-with-lease. Local pushes never run destination hooks
 and refuse checked-out branches. Static HTTP verifies loose/packed objects;
 alternates cannot redirect fetching, and shallow/filter negotiation needs smart Git.
+Empty static repositories must publish their config to identify the object format.
 Push --all selects every local branch; --atomic requires server support and
 updates all requested refs together or none. Local pushes do not support --atomic.
 Push --dry-run checks the destination without sending updates or saving upstreams.

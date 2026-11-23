@@ -86,6 +86,7 @@ pub fn tracking(remote: &str, name: &str) -> Result<String> {
 /// No repository symlink is followed, even during component traversal.
 pub struct Repo {
     pub(crate) root: File,
+    pub format: crate::object::Format,
     pub(crate) common: Option<File>,
     pub(crate) shallow: std::collections::HashSet<Oid>,
     pub(crate) worktree: Option<File>,
@@ -93,6 +94,17 @@ pub struct Repo {
     _common_lock: Option<File>,
 }
 impl Repo {
+    pub fn set_format(&mut self, format: crate::object::Format) -> Result<()> {
+        ensure!(
+            self.read_ref("HEAD")?.is_none() && self.refs()?.is_empty(),
+            "object format can only be set on an empty new repository"
+        );
+        self.format = format;
+        if format == crate::object::Format::Sha256 {
+            self.atomic("config", format!("[core]\nrepositoryformatversion = 1\nbare = {}\n[extensions]\nobjectformat = sha256\n", self.worktree.is_none()).as_bytes())?;
+        }
+        Ok(())
+    }
     pub fn init(path: &Path, initial: &str) -> Result<()> {
         let initial = branch(initial)?;
         std::fs::create_dir(path).context("init requires a new directory")?;
@@ -148,6 +160,7 @@ impl Repo {
             .context("repository is locked by another safe-git operation")?;
         Ok(Self {
             root,
+            format: crate::object::Format::Sha1,
             common: None,
             shallow: Default::default(),
             worktree: None,
@@ -197,6 +210,13 @@ impl Repo {
             .read("config", META_LIMIT)?
             .context("repository has no config")?;
         let bare = validate_config(&config)?;
+        let values = crate::config::parse(&config)?;
+        repo.format = crate::object::Format::parse(
+            values
+                .get("extensions.objectformat")
+                .map(String::as_str)
+                .unwrap_or("sha1"),
+        )?;
         ensure!(
             (repo.common.is_some() && repo.worktree.is_some()) || bare == repo.worktree.is_none(),
             "use the working-tree root for a non-bare repository"
@@ -299,7 +319,10 @@ impl Repo {
             .strip_suffix('\n')
             .unwrap_or(std::str::from_utf8(&bytes)?);
         let Some(name) = value.strip_prefix("ref: ") else {
-            parse_ref(value.as_bytes())?;
+            ensure!(
+                parse_ref(value.as_bytes())?.format() == self.format,
+                "HEAD object format differs"
+            );
             return Ok("HEAD".into());
         };
         ensure!(
@@ -328,7 +351,9 @@ impl Repo {
                 refname(target)?;
                 return self.read_ref_inner(target, seen);
             }
-            return Ok(Some(parse_ref(&value)?));
+            let id = parse_ref(&value)?;
+            ensure!(id.format() == self.format, "ref object format differs");
+            return Ok(Some(id));
         }
         Ok(self.packed_refs()?.get(name).copied())
     }
@@ -339,11 +364,19 @@ impl Repo {
                 .split(|b| *b == b'\n')
                 .filter(|l| !l.is_empty() && l[0] != b'#' && l[0] != b'^')
             {
-                ensure!(line.len() > 41 && line[40] == b' ', "malformed packed-refs");
-                let id = Oid::parse(&line[..40])?;
-                let reference = std::str::from_utf8(&line[41..])?;
+                let (id, reference) = line.split_at(
+                    line.iter()
+                        .position(|b| *b == b' ')
+                        .context("malformed packed-refs")?,
+                );
+                let id = Oid::parse(id)?;
+                ensure!(
+                    id.format() == self.format,
+                    "packed ref object format differs"
+                );
+                let reference = std::str::from_utf8(&reference[1..])?;
                 refname(reference)?;
-                ensure!(id != Oid::ZERO, "zero packed ref");
+                ensure!(!id.is_zero(), "zero packed ref");
                 ensure!(
                     refs.insert(reference.to_owned(), id).is_none(),
                     "duplicate packed ref"
@@ -441,15 +474,19 @@ impl Repo {
             self.read_ref(name)? == expected,
             "ref changed concurrently; retry"
         );
-        Ok(RefUpdate { lock, name: file })
+        Ok(RefUpdate {
+            lock,
+            name: file,
+            format: self.format,
+        })
     }
     pub fn write_object(&self, obj: &Object) -> Result<()> {
-        let id = obj.oid()?.to_string();
+        let id = obj.oid_for(self.format)?.to_string();
         let path = format!("objects/{}/{}", &id[..2], &id[2..]);
         // Verify existing objects rather than silently trusting their filenames.
         if let Some(bytes) = self.read(&path, MAX_OBJECT + 1024 * 1024)? {
             ensure!(
-                loose(&bytes)?.oid()? == obj.oid()?,
+                loose(&bytes)?.oid_for(self.format)? == obj.oid_for(self.format)?,
                 "existing object is corrupt"
             );
             return Ok(());
@@ -465,16 +502,20 @@ fn missing(e: &anyhow::Error) -> bool {
 }
 fn parse_ref(bytes: &[u8]) -> Result<Oid> {
     let id = Oid::parse(bytes.strip_suffix(b"\n").unwrap_or(bytes))?;
-    ensure!(id != Oid::ZERO, "zero object ID in ref");
+    ensure!(!id.is_zero(), "zero object ID in ref");
     Ok(id)
 }
 pub(crate) struct RefUpdate {
+    format: crate::object::Format,
     pub(crate) lock: Pending,
     name: String,
 }
 impl RefUpdate {
     pub(crate) fn commit(mut self, new: Oid) -> Result<()> {
-        ensure!(new != Oid::ZERO, "zero ref update");
+        ensure!(
+            new.format() == self.format && !new.is_zero(),
+            "invalid ref update object format or zero ID"
+        );
         self.lock.file.write_all(format!("{new}\n").as_bytes())?;
         self.lock.commit(&self.name)
     }
@@ -544,7 +585,9 @@ fn validate_config(bytes: &[u8]) -> Result<bool> {
                 .context("invalid repository extension")?;
             ensure!(
                 key.trim().eq_ignore_ascii_case("worktreeconfig")
-                    && matches!(value.trim(), "true" | "false"),
+                    && matches!(value.trim(), "true" | "false")
+                    || key.trim().eq_ignore_ascii_case("objectformat")
+                        && matches!(value.trim(), "sha1" | "sha256"),
                 "unsupported repository extension"
             );
         }
@@ -574,7 +617,7 @@ fn validate_config(bytes: &[u8]) -> Result<bool> {
     }
     ensure!(
         bare.is_some() && version == Some(true),
-        "requires a SHA-1 repository with format version 0 or 1"
+        "requires repository format version 0 or 1"
     );
     Ok(bare == Some(true))
 }
@@ -649,6 +692,10 @@ impl<'a> Store<'a> {
     }
     pub fn add(&mut self, objects: Objects) -> Result<()> {
         for (id, obj) in objects {
+            ensure!(
+                id.format() == self.repo.format && obj.oid_for(self.repo.format)? == id,
+                "incoming object format or hash differs"
+            );
             if !self.incoming.contains_key(&id) {
                 self.incoming_bytes += obj.data.len();
                 ensure!(
@@ -699,9 +746,11 @@ impl<'a> Store<'a> {
                 continue;
             }
             ensure!(
-                name.len() == 50
+                name.len() == self.repo.format.hex_len() + 10
                     && name.starts_with("pack-")
-                    && name.as_bytes()[5..45].iter().all(u8::is_ascii_hexdigit),
+                    && name.as_bytes()[5..5 + self.repo.format.hex_len()]
+                        .iter()
+                        .all(u8::is_ascii_hexdigit),
                 "invalid pack filename"
             );
             let bytes = self
@@ -712,9 +761,16 @@ impl<'a> Store<'a> {
             ensure!(total <= MAX_PACK, "local packs exceed byte limit");
             let index = self
                 .repo
-                .read(&format!("objects/pack/{}.idx", &name[..45]), META_LIMIT)?
+                .read(
+                    &format!(
+                        "objects/pack/{}.idx",
+                        &name[..5 + self.repo.format.hex_len()]
+                    ),
+                    META_LIMIT,
+                )?
                 .context("pack has no index")?;
-            self.packs.push(Packed::new(bytes, &index)?);
+            self.packs
+                .push(Packed::new_for(bytes, &index, self.repo.format)?);
         }
         Ok(())
     }
@@ -751,7 +807,9 @@ impl Store<'_> {
                 );
                 let file = file?;
                 let suffix = file.file_name().to_str()?;
-                if suffix.len() == 38 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                if suffix.len() == self.repo.format.hex_len() - 2
+                    && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+                {
                     ids.insert(Oid::parse(format!("{name}{suffix}").as_bytes())?);
                 }
                 ensure!(ids.len() <= MAX_OBJECTS, "object count exceeds limit");
@@ -773,7 +831,10 @@ impl Store<'_> {
             MAX_OBJECT + 1024 * 1024,
         )? {
             let obj = Arc::new(loose(&bytes)?);
-            ensure!(obj.oid()? == oid, "object hash mismatch: {oid}");
+            ensure!(
+                obj.oid_for(self.repo.format)? == oid,
+                "object hash mismatch: {oid}"
+            );
             self.insert(oid, Arc::clone(&obj))?;
             return Ok(obj);
         }
@@ -801,13 +862,19 @@ impl Store<'_> {
         };
         *decoded += object.data.len();
         ensure!(*decoded <= MAX_TOTAL, "local delta byte budget exceeded");
-        ensure!(object.oid()? == oid, "packed object hash mismatch: {oid}");
+        ensure!(
+            object.oid_for(self.repo.format)? == oid,
+            "packed object hash mismatch: {oid}"
+        );
         let object = Arc::new(object);
         self.insert(oid, Arc::clone(&object))?;
         Ok(object)
     }
 }
 impl ReadObjects for Store<'_> {
+    fn format(&self) -> crate::object::Format {
+        self.repo.format
+    }
     fn shallow(&self, id: Oid) -> bool {
         self.shallow.contains(&id)
     }
@@ -820,6 +887,10 @@ impl ReadObjects for Store<'_> {
         })
     }
     fn get(&mut self, oid: Oid) -> Result<Arc<Object>> {
+        ensure!(
+            oid.format() == self.repo.format,
+            "object format differs from repository"
+        );
         match self.get_inner(oid, 0, &mut 0) {
             Err(error)
                 if error.downcast_ref::<MissingObject>().is_some() && self.allow_promisor =>
@@ -844,7 +915,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("repo");
         Repo::init(&path, "main").unwrap();
-        let id = Oid([1; 20]);
+        let id = Oid::sha1([1; 20]);
         std::fs::write(path.join("packed-refs"), format!("{id} refs/heads/main\n")).unwrap();
         let repo = Repo::open(&path).unwrap();
         assert!(repo.update_ref("refs/heads/main/nested", None, id).is_err());

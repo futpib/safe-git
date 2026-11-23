@@ -78,9 +78,9 @@ pub fn run(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Re
                 )
                 .into_bytes(),
             };
-            obj.children()?;
+            obj.children_for(repo.format)?;
             repo.write_object(&obj)?;
-            obj.oid()?
+            obj.oid_for(repo.format)?
         } else {
             target
         };

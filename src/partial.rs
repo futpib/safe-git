@@ -56,8 +56,8 @@ pub fn store_pack(repo: &Repo, objects: &Objects) -> Result<()> {
     let mut objects: Vec<_> = objects.iter().collect();
     objects.sort_by_key(|(id, _)| **id);
     let objects: Vec<_> = objects.into_iter().map(|(_, o)| o.clone()).collect();
-    let (pack, index) = crate::pack::encode_indexed(&objects, true)?;
-    let id = Oid(pack[pack.len() - 20..].try_into()?);
+    let (pack, index) = crate::pack::encode_indexed_for(&objects, true, repo.format)?;
+    let id = Oid::from_bytes(&pack[pack.len() - repo.format.bytes()..])?;
     let path = format!("objects/pack/pack-{id}");
     repo.atomic(&format!("{path}.idx"), &index)?;
     repo.atomic(&format!("{path}.promisor"), b"")?;
@@ -109,7 +109,7 @@ pub fn persist(
             ensure!(object.kind == kind, "object type mismatch");
             total += object.data.len();
             ensure!(total <= MAX_TOTAL, "partial object budget exceeded");
-            for (child, expected) in object.children()? {
+            for (child, expected) in object.children_for(repo.format)? {
                 if !(kind == Kind::Commit
                     && expected == Kind::Commit
                     && store.shallow.contains(&id))

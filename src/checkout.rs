@@ -27,6 +27,7 @@ pub(crate) const INDEX_LIMIT: usize = 64 * 1024 * 1024;
 
 pub(crate) struct Work<'a> {
     root: &'a File,
+    format: object::Format,
     device: u64,
 }
 impl<'a> Work<'a> {
@@ -40,7 +41,11 @@ impl<'a> Work<'a> {
             repo.root.metadata()?.dev() == device,
             "worktree and .git must be on the same filesystem"
         );
-        Ok(Self { root, device })
+        Ok(Self {
+            root,
+            device,
+            format: repo.format,
+        })
     }
     pub(crate) fn parent(&self, path: &[u8]) -> Result<(File, Vec<u8>)> {
         index::path(path)?;
@@ -65,7 +70,7 @@ impl<'a> Work<'a> {
             Err(e) if missing(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
-        entry_at(&dir, &name, self.device)
+        entry_at(&dir, &name, self.device, self.format)
     }
     fn plan_directories(
         &self,
@@ -100,7 +105,7 @@ impl<'a> Work<'a> {
 fn missing(e: &anyhow::Error) -> bool {
     e.downcast_ref::<Errno>() == Some(&Errno::NOENT)
 }
-fn entry_at(dir: &File, name: &[u8], device: u64) -> Result<Option<Entry>> {
+fn entry_at(dir: &File, name: &[u8], device: u64, format: object::Format) -> Result<Option<Entry>> {
     let stat = match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(s) => s,
         Err(Errno::NOENT) => return Ok(None),
@@ -160,7 +165,7 @@ fn entry_at(dir: &File, name: &[u8], device: u64) -> Result<Option<Entry>> {
             kind: Kind::Blob,
             data,
         }
-        .oid()?,
+        .oid_for(format)?,
     }))
 }
 pub(crate) fn symlink_target(path: &[u8], target: &[u8]) -> Result<()> {
@@ -258,7 +263,7 @@ impl Journal {
         }
         ensure!(
             (self.head == "HEAD" || self.head.starts_with("refs/heads/"))
-                && (self.new != Oid::ZERO || (self.old.is_none() && self.head_after.is_none())),
+                && (!self.new.is_zero() || (self.old.is_none() && self.head_after.is_none())),
             "invalid journal branch"
         );
         let mut names = BTreeSet::new();
@@ -329,7 +334,7 @@ pub fn edit(repo: &Repo, store: &mut Store<'_>, edit: Edit) -> Result<()> {
         store,
         Update {
             reference: &head,
-            old: (tip != Oid::ZERO).then_some(tip),
+            old: (!tip.is_zero()).then_some(tip),
             new: tip,
             after: edit.after.clone(),
             force: false,
@@ -403,8 +408,8 @@ fn apply_inner(
     let before = if let Some(edit) = &edit {
         ensure!(head == edit.head, "HEAD changed concurrently");
         ensure!(
-            index::encode_full(&index, &conflicts)?
-                == index::encode_full(&edit.index_before, &edit.conflicts_before)?,
+            index::encode_full_for(&index, &conflicts, repo.format)?
+                == index::encode_full_for(&edit.index_before, &edit.conflicts_before, repo.format)?,
             "index changed concurrently"
         );
         edit.before.clone()
@@ -530,7 +535,7 @@ fn apply_inner(
         conflicts_after = edit.conflicts_after;
     }
     index::no_prefix_conflicts(&index)?;
-    let new_index = index::encode_full(&index, &conflicts_after)?;
+    let new_index = index::encode_full_for(&index, &conflicts_after, repo.format)?;
     let journal = Journal {
         version: 2,
         head: head.clone(),
@@ -627,7 +632,7 @@ fn apply_inner(
         );
         index_lock.file.write_all(&new_index)?;
         index_lock.commit("index")?;
-        if new != Oid::ZERO {
+        if !new.is_zero() {
             ref_update.commit(new)?;
         } else {
             drop(ref_update);
@@ -684,7 +689,7 @@ pub fn snapshot(repo: &Repo, entries: &Entries) -> Result<Entries> {
             Err(e) if missing(&e) => continue,
             Err(e) => return Err(e),
         };
-        let Some(actual) = entry_at(&dir, &name, work.device)? else {
+        let Some(actual) = entry_at(&dir, &name, work.device, repo.format)? else {
             continue;
         };
         index::mode(actual.mode)?;
@@ -713,7 +718,10 @@ pub fn snapshot(repo: &Repo, entries: &Entries) -> Result<Entries> {
             kind: Kind::Blob,
             data,
         };
-        ensure!(obj.oid()? == actual.oid, "worktree changed during snapshot");
+        ensure!(
+            obj.oid_for(repo.format)? == actual.oid,
+            "worktree changed during snapshot"
+        );
         repo.write_object(&obj)?;
         result.insert(path.clone(), actual);
     }
@@ -818,8 +826,8 @@ pub fn recover(repo: &Repo) -> Result<()> {
         None
     };
     let mut index_lock = Pending::new(repo.root.try_clone()?, "index.lock".into())?;
-    if ((journal.new == Oid::ZERO && tip.is_none()) || tip == Some(journal.new))
-        && ((journal.new != Oid::ZERO && journal.old != Some(journal.new))
+    if ((journal.new.is_zero() && tip.is_none()) || tip == Some(journal.new))
+        && ((!journal.new.is_zero() && journal.old != Some(journal.new))
             || repo.read(&format!("{TXN}/committed"), 16)?.as_deref() == Some(b"done\n"))
     {
         // The ref was committed last: all file/index changes finished. Leave any
@@ -852,7 +860,7 @@ pub fn recover(repo: &Repo) -> Result<()> {
         let actual = work.state(&change.path)?;
         if has_backup {
             ensure!(
-                entry_at(&txn, backup.as_bytes(), work.device)? == change.old,
+                entry_at(&txn, backup.as_bytes(), work.device, repo.format)? == change.old,
                 "worktree backup does not match journal"
             );
             let (dir, name) = work.parent(&change.path)?;

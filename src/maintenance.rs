@@ -33,7 +33,7 @@ pub fn run(
             total <= object::MAX_TOTAL,
             "verification byte budget exceeded"
         );
-        for (child, expected) in obj.children()? {
+        for (child, expected) in obj.children_for(repo.format)? {
             if obj.kind == object::Kind::Commit
                 && repo.shallow.contains(id)
                 && expected == object::Kind::Commit
@@ -67,7 +67,7 @@ pub fn run(
             .values()
             .chain(conflicts.values().flat_map(|v| v.iter().flatten()))
         {
-            if e.mode != 0o160000 {
+            if e.mode != 0o160000 && e.flags & crate::index::INTENT == 0 {
                 ensure!(
                     store.get(e.oid)?.kind == object::Kind::Blob,
                     "index entry is not a blob"
@@ -82,9 +82,9 @@ pub fn run(
             .iter()
             .map(|id| store.get(*id))
             .collect::<Result<Vec<_>>>()?;
-        let (pack, index) = crate::pack::encode_indexed(&objects, true)?;
-        crate::packed::Packed::new(pack.clone(), &index)?;
-        let name = hex::encode(&pack[pack.len() - 20..]);
+        let (pack, index) = crate::pack::encode_indexed_for(&objects, true, repo.format)?;
+        crate::packed::Packed::new_for(pack.clone(), &index, repo.format)?;
+        let name = hex::encode(&pack[pack.len() - repo.format.bytes()..]);
         repo.atomic(&format!("objects/pack/pack-{name}.idx"), &index)?;
         repo.atomic(&format!("objects/pack/pack-{name}.pack"), &pack)?;
         // Keep pre-existing packs: live Git readers may have their indexes open.

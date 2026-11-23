@@ -113,11 +113,11 @@ pub async fn run(
             dest = source.clone();
         }
         let tip = if deleting {
-            Oid::ZERO
+            repo.format.zero()
         } else {
             revision::resolve(repo, store, &source)?
         };
-        if tip != Oid::ZERO && dest.starts_with("refs/heads/") {
+        if !tip.is_zero() && dest.starts_with("refs/heads/") {
             ensure!(
                 store.get(tip)?.kind == Kind::Commit,
                 "branch push requires a commit"
@@ -140,6 +140,10 @@ pub async fn run(
     let mut planned = Vec::new();
     for (source, dest, tip, force) in updates {
         let push = network::Push::prepare(&endpoint, &auth, &dest).await?;
+        ensure!(
+            push.advertisement().format() == repo.format,
+            "push object format mismatch"
+        );
         ensure!(
             !options.atomic || push.advertisement().caps.contains("atomic"),
             "server does not support atomic push"
@@ -172,7 +176,7 @@ pub async fn run(
                 "force-with-lease rejected: remote ref changed"
             );
         }
-        if let Some(old) = old.filter(|_| tip != Oid::ZERO)
+        if let Some(old) = old.filter(|_| !tip.is_zero())
             && old != tip
             && !force
             && options.lease.is_none()
@@ -202,7 +206,7 @@ pub async fn run(
     if options.atomic && !options.dry_run {
         let updates: Vec<_> = planned
             .iter()
-            .filter(|(_, _, tip, old)| *old != Some(*tip) && !(old.is_none() && *tip == Oid::ZERO))
+            .filter(|(_, _, tip, old)| *old != Some(*tip) && !(old.is_none() && tip.is_zero()))
             .map(|(_, name, new, old)| crate::protocol::RefUpdate {
                 name: name.clone(),
                 old: *old,
@@ -212,7 +216,7 @@ pub async fn run(
         if !updates.is_empty() {
             let mut ids = BTreeSet::new();
             for update in &updates {
-                if update.new != Oid::ZERO {
+                if !update.new.is_zero() {
                     ids.extend(reachable(store, update.new)?);
                 }
             }
@@ -220,10 +224,10 @@ pub async fn run(
                 .into_iter()
                 .map(|id| store.get(id))
                 .collect::<Result<Vec<_>>>()?;
-            let pack = if updates.iter().all(|u| u.new == Oid::ZERO) {
+            let pack = if updates.iter().all(|u| u.new.is_zero()) {
                 Vec::new()
             } else {
-                pack::encode(&objects)?
+                pack::encode_for(&objects, repo.format)?
             };
             let push = network::Push::prepare(&endpoint, &auth, &updates[0].name).await?;
             push.send_many(&updates, true, pack).await?;
@@ -236,13 +240,13 @@ pub async fn run(
                     "Would push {} -> {}{}",
                     crate::compat::text(&source),
                     crate::compat::text(&dest),
-                    if tip == Oid::ZERO { " (delete)" } else { "" }
+                    if tip.is_zero() { " (delete)" } else { "" }
                 );
             }
             continue;
         }
-        if !options.atomic && old != Some(tip) && !(old.is_none() && tip == Oid::ZERO) {
-            let objects = if tip == Oid::ZERO {
+        if !options.atomic && old != Some(tip) && !(old.is_none() && tip.is_zero()) {
+            let objects = if tip.is_zero() {
                 Vec::new()
             } else {
                 reachable(store, tip)?
@@ -250,12 +254,16 @@ pub async fn run(
                     .map(|id| store.get(id))
                     .collect::<Result<Vec<_>>>()?
             };
-            let pack = if tip == Oid::ZERO {
+            let pack = if tip.is_zero() {
                 Vec::new()
             } else {
-                pack::encode(&objects)?
+                pack::encode_for(&objects, repo.format)?
             };
             let push = network::Push::prepare(&endpoint, &auth, &dest).await?;
+            ensure!(
+                push.advertisement().format() == repo.format,
+                "push object format mismatch"
+            );
             ensure!(
                 push.old() == old,
                 "push rejected: destination changed while preparing transfer; retry"
@@ -292,7 +300,7 @@ pub async fn run(
         {
             let reference = crate::repo::tracking(&b.remote, branch)?;
             let previous = repo.read_ref(&reference)?;
-            if tip == Oid::ZERO {
+            if tip.is_zero() {
                 if let Some(previous) = previous {
                     repo.delete_ref(&reference, previous)?;
                 }
@@ -303,7 +311,7 @@ pub async fn run(
         if !cli.quiet {
             if old == Some(tip) {
                 eprintln!("Everything up-to-date");
-            } else if tip == Oid::ZERO {
+            } else if tip.is_zero() {
                 eprintln!("Deleted {}", crate::compat::text(&dest));
             } else {
                 eprint!(

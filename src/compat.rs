@@ -308,9 +308,14 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                     "--is-bare-repository",
                     "--is-inside-work-tree",
                     "--show-toplevel",
+                    "--show-object-format",
                     "--abbrev-ref",
                 ],
             )?;
+            if flag(items, "--show-object-format") {
+                println!("{}", repo.format.name());
+                return Ok(());
+            }
             if flag(items, "--git-path") {
                 ensure!(
                     pos.len() == 1
@@ -373,9 +378,12 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                 let length = if flag(items, "--short") || option(items, "--short=").is_some() {
                     option(items, "--short=").unwrap_or("7").parse::<usize>()?
                 } else {
-                    40
+                    repo.format.hex_len()
                 };
-                ensure!((4..=40).contains(&length), "invalid abbreviation length");
+                ensure!(
+                    (4..=repo.format.hex_len()).contains(&length),
+                    "invalid abbreviation length"
+                );
                 println!("{}", abbrev(&mut store, id, length)?);
             }
             Ok(())
@@ -421,7 +429,7 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                 );
                 if pos.len() == 2 {
                     ensure!(
-                        old.unwrap_or(Oid::ZERO) == Oid::parse(pos[1].as_bytes())?,
+                        old.unwrap_or(repo.format.zero()) == Oid::parse(pos[1].as_bytes())?,
                         "ref changed concurrently"
                     );
                 }
@@ -433,7 +441,7 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             if pos.len() == 3 {
                 let expected = Oid::parse(pos[2].as_bytes())?;
                 ensure!(
-                    old.unwrap_or(Oid::ZERO) == expected,
+                    old.unwrap_or(repo.format.zero()) == expected,
                     "ref changed concurrently"
                 );
             }
@@ -729,6 +737,7 @@ pub async fn fetch_binding(
         "registered repository mode changed"
     );
     let ad = network::discover(&binding.url, &cli.auth()?).await?;
+    ensure!(ad.format() == repo.format, "fetch object format mismatch");
     let selected: HashMap<_, _> = ad
         .refs
         .iter()
@@ -835,13 +844,13 @@ pub async fn fetch_binding(
     Ok(())
 }
 fn abbrev(store: &mut Store<'_>, id: Oid, length: usize) -> Result<String> {
-    if length == 40 {
+    if length == id.format().hex_len() {
         return Ok(id.to_string());
     }
     let ids = store.ids()?;
     let full = id.to_string();
     let mut length = length;
-    while length < 40
+    while length < id.format().hex_len()
         && ids
             .iter()
             .any(|other| *other != id && other.to_string().starts_with(&full[..length]))
@@ -1560,7 +1569,7 @@ fn history_patch(
         parents
             .first()
             .map(ToString::to_string)
-            .unwrap_or(revision::EMPTY_TREE.into()),
+            .unwrap_or(repo.format.empty_tree()?.to_string()),
         id.to_string(),
     ];
     if let Some(paths) = paths {
@@ -1638,7 +1647,10 @@ fn describe(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Result<()> 
     }
     candidates.sort();
     let length = option(items, "--abbrev=").unwrap_or("7").parse::<usize>()?;
-    ensure!(length <= 40, "invalid abbreviation length");
+    ensure!(
+        length <= repo.format.hex_len(),
+        "invalid abbreviation length"
+    );
     let mut value = if let Some((distance, _, name)) = candidates.first() {
         ensure!(
             !flag(items, "--exact-match") || *distance == 0,

@@ -10,6 +10,20 @@ use anyhow::{Context, Result, bail, ensure};
 use std::io::Write;
 
 const LIMIT: usize = 8 * 1024 * 1024;
+pub fn log_ids(line: &[u8]) -> Result<(Oid, Oid)> {
+    ensure!(
+        line.ends_with(b"\n") && line.contains(&b'\t'),
+        "invalid reflog"
+    );
+    let mut parts = line.splitn(3, |b| *b == b' ');
+    let old = Oid::parse(parts.next().unwrap_or_default())?;
+    let new = Oid::parse(parts.next().unwrap_or_default())?;
+    ensure!(
+        old.format() == new.format() && parts.next().is_some_and(|v| !v.is_empty()),
+        "invalid reflog"
+    );
+    Ok((old, new))
+}
 pub fn log_entries(repo: &Repo, name: &str) -> Result<Vec<Vec<u8>>> {
     crate::repo::reference(name)?;
     let bytes = repo
@@ -22,15 +36,9 @@ pub fn log_entries(repo: &Repo, name: &str) -> Result<Vec<Vec<u8>>> {
     ensure!(lines.len() <= 10000, "reflog entry limit exceeded");
     for line in &lines {
         ensure!(
-            line.len() >= 84
-                && line[40] == b' '
-                && line[81] == b' '
-                && line.ends_with(b"\n")
-                && line.contains(&b'\t'),
-            "invalid reflog"
+            log_ids(line)?.0.format() == repo.format,
+            "reflog object format mismatch"
         );
-        Oid::parse(&line[..40])?;
-        Oid::parse(&line[41..81])?;
     }
     Ok(lines)
 }
@@ -67,7 +75,7 @@ pub fn prepare_log<'a>(
     bytes.extend_from_slice(
         format!(
             "{} {new} safe-git <safe-git@localhost> {now} +0000\t{message}\n",
-            old.unwrap_or(Oid::ZERO)
+            old.unwrap_or(repo.format.zero())
         )
         .as_bytes(),
     );
@@ -142,7 +150,7 @@ pub fn reflog(repo: &Repo, args: &[String]) -> Result<()> {
         .take(count)
         .enumerate()
     {
-        let id = Oid::parse(&line[41..81])?;
+        let id = log_ids(line)?.1;
         let message = line.splitn(2, |b| *b == b'\t').nth(1).unwrap();
         println!(
             "{} {}@{{{i}}}: {}",
@@ -369,7 +377,8 @@ pub fn reset(repo: &Repo, store: &mut Store<'_>, args: &[String], quiet: bool) -
         let mut lock = Pending::new(repo.root.try_clone()?, "index.lock".into())?;
         let mut entries = porcelain::tree(store, id)?;
         crate::sparse::mark(repo, &mut entries)?;
-        lock.file.write_all(&index::encode(&entries)?)?;
+        lock.file
+            .write_all(&index::encode_for(&entries, repo.format)?)?;
         lock.commit("index")?;
     }
     if let Some(old) = old {

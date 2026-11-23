@@ -271,11 +271,11 @@ fn parse(bytes: &[u8], strip: usize) -> Result<Vec<Change>> {
                 c.new = path(v, 0)?;
             } else if let Some(v) = line.strip_prefix(b"index ") {
                 if let Some(ids) = v.split(|b| *b == b' ' || *b == b'\n').next()
-                    && ids.len() == 82
-                    && &ids[40..42] == b".."
+                    && matches!(ids.len(), 82 | 130)
+                    && &ids[(ids.len() - 2) / 2..(ids.len() + 2) / 2] == b".."
                 {
-                    c.old_oid = Some(Oid::parse(&ids[..40])?);
-                    c.new_oid = Some(Oid::parse(&ids[42..])?);
+                    c.old_oid = Some(Oid::parse(&ids[..(ids.len() - 2) / 2])?);
+                    c.new_oid = Some(Oid::parse(&ids[(ids.len() + 2) / 2..])?);
                 }
                 if let Some(v) = v.split(|b| *b == b' ').nth(1) {
                     let m = mode(v)?;
@@ -407,7 +407,7 @@ fn transform(
                 "binary patch requires full object IDs"
             );
             ensure!(
-                c.old_oid == Some(entry.map(|e| e.oid).unwrap_or(Oid::ZERO)),
+                c.old_oid == Some(entry.map(|e| e.oid).unwrap_or(repo.format.zero())),
                 "binary patch source differs"
             );
         }
@@ -419,13 +419,13 @@ fn transform(
             let bytes = block.apply(&old)?;
             let id = if c.new.is_none() {
                 ensure!(bytes.is_empty(), "binary deletion has content");
-                Oid::ZERO
+                repo.format.zero()
             } else {
                 Object {
                     kind: Kind::Blob,
                     data: bytes.clone(),
                 }
-                .oid()?
+                .oid_for(repo.format)?
             };
             ensure!(c.new_oid == Some(id), "binary patch result hash mismatch");
             bytes
@@ -474,7 +474,7 @@ fn transform(
                     kind: Kind::Blob,
                     data,
                 };
-                let id = obj.oid()?;
+                let id = obj.oid_for(repo.format)?;
                 repo.write_object(&obj)?;
                 id
             };
@@ -507,7 +507,8 @@ fn install_index(repo: &Repo, before: &Entries, after: &Entries) -> Result<()> {
         repo.head()? == head && porcelain::index(repo)? == *before,
         "HEAD or index changed concurrently"
     );
-    lock.file.write_all(&index::encode(after)?)?;
+    lock.file
+        .write_all(&index::encode_for(after, repo.format)?)?;
     lock.commit("index")
 }
 fn apply_changes(
@@ -579,7 +580,7 @@ fn apply_changes(
         store,
         Edit {
             head: repo.head()?,
-            tip: repo.read_ref("HEAD")?.unwrap_or(Oid::ZERO),
+            tip: repo.read_ref("HEAD")?.unwrap_or(repo.format.zero()),
             before,
             after,
             index_before: staged,
@@ -678,8 +679,8 @@ fn patch_between(store: &mut Store<'_>, before: &Entries, after: &Entries) -> Re
         writeln!(
             out,
             "index {}..{}{}",
-            a.map(|e| e.oid).unwrap_or(Oid::ZERO),
-            b.map(|e| e.oid).unwrap_or(Oid::ZERO),
+            a.map(|e| e.oid).unwrap_or(store.format().zero()),
+            b.map(|e| e.oid).unwrap_or(store.format().zero()),
             a.zip(b)
                 .filter(|(a, b)| a.mode == b.mode)
                 .map(|(a, _)| format!(" {:06o}", a.mode))
@@ -855,9 +856,8 @@ fn letters(bytes: &[u8]) -> Result<Vec<Letter>> {
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
         if line.strip_prefix("From ").is_some_and(|v| {
-            v.len() > 40
-                && v.as_bytes()[40] == b' '
-                && v.as_bytes()[..40].iter().all(u8::is_ascii_hexdigit)
+            v.split_once(' ')
+                .is_some_and(|(id, _)| Oid::parse(id.as_bytes()).is_ok())
         }) {
             starts.push(offset);
         }

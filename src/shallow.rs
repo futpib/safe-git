@@ -6,7 +6,7 @@ use anyhow::{Result, ensure};
 use std::collections::{HashSet, VecDeque};
 pub fn read(repo: &Repo) -> Result<HashSet<Oid>> {
     let mut result = HashSet::new();
-    if let Some(bytes) = repo.read("shallow", MAX_OBJECTS * 41)? {
+    if let Some(bytes) = repo.read("shallow", MAX_OBJECTS * (repo.format.hex_len() + 1))? {
         ensure!(
             !bytes.is_empty() && bytes.ends_with(b"\n"),
             "invalid shallow boundaries"
@@ -14,7 +14,7 @@ pub fn read(repo: &Repo) -> Result<HashSet<Oid>> {
         for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
             let id = Oid::parse(line)?;
             ensure!(
-                id != Oid::ZERO && result.insert(id),
+                id.format() == repo.format && !id.is_zero() && result.insert(id),
                 "invalid or duplicate shallow boundary"
             );
         }
@@ -22,6 +22,10 @@ pub fn read(repo: &Repo) -> Result<HashSet<Oid>> {
     Ok(result)
 }
 pub fn save(repo: &Repo, boundary: &HashSet<Oid>) -> Result<()> {
+    ensure!(
+        boundary.iter().all(|id| id.format() == repo.format),
+        "shallow object format mismatch"
+    );
     if boundary.is_empty() {
         return repo.remove("shallow");
     }

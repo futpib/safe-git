@@ -8,6 +8,7 @@ use anyhow::{Context, Result, ensure};
 use std::collections::HashMap;
 
 pub struct Packed {
+    format: object::Format,
     data: Vec<u8>,
     pub ids: HashMap<Oid, usize>,
     offsets: HashMap<usize, Oid>,
@@ -25,9 +26,10 @@ fn u32_at(bytes: &[u8], pos: usize) -> Result<u32> {
     ))
 }
 impl Packed {
-    pub fn new(data: Vec<u8>, index: &[u8]) -> Result<Self> {
+    pub fn new_for(data: Vec<u8>, index: &[u8], format: object::Format) -> Result<Self> {
+        let hash_len = format.bytes();
         ensure!(
-            (32..=MAX_PACK).contains(&data.len()) && &data[..4] == b"PACK",
+            (12 + hash_len..=MAX_PACK).contains(&data.len()) && &data[..4] == b"PACK",
             "invalid local pack"
         );
         ensure!(
@@ -36,21 +38,24 @@ impl Packed {
         );
         let count = u32_at(&data, 8)? as usize;
         ensure!(count <= MAX_OBJECTS, "pack object count exceeds limit");
-        let trailer = data.len() - 20;
+        let trailer = data.len() - hash_len;
         ensure!(
-            object::hash(&[&data[..trailer]])?.0 == data[trailer..],
+            object::hash_for(format, &[&data[..trailer]])?.0 == data[trailer..],
             "pack checksum mismatch"
         );
         ensure!(
-            index.len() >= 1072 && &index[..4] == b"\xfftOc" && u32_at(index, 4)? == 2,
+            index.len() >= 1032 + 2 * hash_len
+                && &index[..4] == b"\xfftOc"
+                && u32_at(index, 4)? == 2,
             "requires a v2 Git pack index"
         );
         ensure!(
-            object::hash(&[&index[..index.len() - 20]])?.0 == index[index.len() - 20..],
+            object::hash_for(format, &[&index[..index.len() - hash_len]])?.0
+                == index[index.len() - hash_len..],
             "pack index checksum mismatch"
         );
         ensure!(
-            index[index.len() - 40..index.len() - 20] == data[trailer..],
+            index[index.len() - 2 * hash_len..index.len() - hash_len] == data[trailer..],
             "pack index identifies a different pack"
         );
         ensure!(
@@ -58,10 +63,11 @@ impl Packed {
             "index object count mismatch"
         );
         let names = 1032;
-        let offsets_at = names + count * 24;
+        let offsets_at = names + count * (hash_len + 4);
         let large_at = offsets_at + count * 4;
         ensure!(
-            large_at + 40 <= index.len() && (index.len() - large_at - 40).is_multiple_of(8),
+            large_at + 2 * hash_len <= index.len()
+                && (index.len() - large_at - 2 * hash_len).is_multiple_of(8),
             "invalid pack index length"
         );
         let mut ids = HashMap::new();
@@ -69,7 +75,7 @@ impl Packed {
         let mut previous = None;
         let mut buckets = [0u32; 256];
         for i in 0..count {
-            let id = Oid(index[names + i * 20..names + (i + 1) * 20].try_into()?);
+            let id = Oid::from_bytes(&index[names + i * hash_len..names + (i + 1) * hash_len])?;
             ensure!(
                 previous.is_none_or(|p| p < id),
                 "pack index IDs are not ordered"
@@ -82,7 +88,7 @@ impl Packed {
             } else {
                 let position = large_at + (encoded & 0x7fff_ffff) as usize * 8;
                 ensure!(
-                    position + 8 <= index.len() - 40,
+                    position + 8 <= index.len() - 2 * hash_len,
                     "invalid large pack offset"
                 );
                 usize::try_from(u64::from_be_bytes(
@@ -107,10 +113,16 @@ impl Packed {
                 "invalid pack index fanout"
             );
         }
-        Ok(Self { data, ids, offsets })
+        Ok(Self {
+            data,
+            ids,
+            offsets,
+            format,
+        })
     }
     pub fn entry(&self, offset: usize) -> Result<Entry> {
-        let data = &self.data[..self.data.len() - 20];
+        let hash_len = self.format.bytes();
+        let data = &self.data[..self.data.len() - hash_len];
         let mut pos = offset;
         let mut read = || -> Result<u8> {
             let b = *data.get(pos).context("truncated pack entry")?;
@@ -151,11 +163,11 @@ impl Packed {
                 )
             }
             7 => {
-                let mut id = [0; 20];
+                let mut id = vec![0; hash_len];
                 for byte in &mut id {
                     *byte = read()?;
                 }
-                Some(Oid(id))
+                Some(Oid::from_bytes(&id)?)
             }
             _ => {
                 Kind::from_number(kind)?;

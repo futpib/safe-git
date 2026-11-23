@@ -224,6 +224,7 @@ fn children(
     path: &[u8],
     count: &mut usize,
 ) -> Result<Vec<(Vec<u8>, Oid, u32)>> {
+    let hash_len = store.format().bytes();
     let obj = store.get(id)?;
     ensure!(obj.kind == Kind::Tree, "invalid archive tree");
     let mut bytes = obj.data.as_slice();
@@ -239,7 +240,7 @@ fn children(
         let mode = u32::from_str_radix(std::str::from_utf8(&bytes[..space])?, 8)?;
         let rest = &bytes[space + 1..];
         let nul = rest.iter().position(|b| *b == 0).context("invalid tree")?;
-        ensure!(rest.len() >= nul + 21, "truncated tree");
+        ensure!(rest.len() >= nul + 1 + hash_len, "truncated tree");
         let name = &rest[..nul];
         ensure!(
             !name.contains(&b'/') && names.insert(name.to_vec()),
@@ -248,14 +249,14 @@ fn children(
         let mut full = path.to_vec();
         full.extend(name);
         index::path(&full)?;
-        let id = Oid(rest[nul + 1..nul + 21].try_into()?);
+        let id = Oid::from_bytes(&rest[nul + 1..nul + 1 + hash_len])?;
         if mode == 0o40000 || mode == 0o160000 {
             full.push(b'/');
         } else {
             index::mode(mode)?;
         }
         children.push((full, id, mode));
-        bytes = &rest[nul + 21..];
+        bytes = &rest[nul + 1 + hash_len..];
     }
     children.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(children)

@@ -4,7 +4,7 @@ use crate::{
     checkout::{self, Edit, Work},
     compat, ignore,
     index::{self, Entries, Entry},
-    object::{MAX_OBJECTS, Oid, ReadObjects},
+    object::{MAX_OBJECTS, ReadObjects},
     porcelain,
     repo::{Pending, Repo, Store},
     revision,
@@ -188,7 +188,7 @@ fn save_index(
     head: &[u8],
     entries: &Entries,
 ) -> Result<()> {
-    let encoded = index::encode(entries)?;
+    let encoded = index::encode_for(entries, repo.format)?;
     unchanged(repo, original, head)?;
     lock.file.write_all(&encoded)?;
     lock.commit("index")
@@ -406,7 +406,7 @@ fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
                 Entry {
                     flags: 0,
                     mode: 0o100644,
-                    oid: Oid::ZERO,
+                    oid: repo.format.zero(),
                 },
             );
         }
@@ -423,7 +423,7 @@ fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
             if !original_staged.contains_key(path)
                 || original_staged[path].flags & index::INTENT != 0
             {
-                entry.oid = empty.oid()?;
+                entry.oid = empty.oid_for(repo.format)?;
                 entry.flags = index::INTENT;
             } else {
                 *entry = original_staged[path];
@@ -448,7 +448,7 @@ fn add(cli: &Cli, repo: &Repo, args: &[String]) -> Result<()> {
             staged.remove(path);
         }
     }
-    let encoded = index::encode_full(&staged, &conflicts)?;
+    let encoded = index::encode_full_for(&staged, &conflicts, repo.format)?;
     unchanged(repo, &original, &head)?;
     lock.file.write_all(&encoded)?;
     lock.commit("index")
@@ -763,7 +763,8 @@ fn switch(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Res
     };
     if let Some(previous) = &previous {
         value = Some(previous);
-        detached |= previous.len() == 40 && previous.bytes().all(|b| b.is_ascii_hexdigit());
+        detached |= previous.len() == repo.format.hex_len()
+            && previous.bytes().all(|b| b.is_ascii_hexdigit());
     }
     let mut inferred = None;
     let mut remote_start = None;
@@ -1137,7 +1138,7 @@ fn status(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Res
         }
     }
     let mode = |e: Option<Entry>| e.map(|e| e.mode).unwrap_or(0);
-    let oid = |e: Option<Entry>| e.map(|e| e.oid).unwrap_or(Oid::ZERO);
+    let oid = |e: Option<Entry>| e.map(|e| e.oid).unwrap_or(repo.format.zero());
     if short {
         for (x, y, path, from, score, a, b, c) in &rows {
             if v2 {

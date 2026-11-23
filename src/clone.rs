@@ -133,11 +133,12 @@ pub async fn run(
         branch != "HEAD" && !branch.starts_with("HEAD/"),
         "branch conflicts with remote HEAD"
     );
-    let repo = if options.bare {
+    let mut repo = if options.bare {
         Repo::init_bare_existing(destination.staging.path(), &branch)?
     } else {
         Repo::init_worktree(destination.staging.path(), &branch)?
     };
+    repo.set_format(ad.format())?;
     let selected: std::collections::HashMap<_, _> = ad
         .refs
         .iter()
@@ -255,10 +256,22 @@ pub async fn run(
     } else {
         format!("+refs/heads/*:refs/remotes/{}/*", options.remote)
     };
-    repo.atomic("config", format!(
-        "[core]\n\trepositoryformatversion = 0\n\tbare = {}\n[remote {}]\n\turl = {}\n\tfetch = {}\n[branch {}]\n\tremote = {}\n\tmerge = {}\n",
-        options.bare,quote(options.remote),quote(&url),quote(&refspec),quote(&branch),quote(options.remote),quote(&format!("refs/heads/{branch}")),
-    ).as_bytes())?;
+    let mut config = repo
+        .read("config", 8 * 1024 * 1024)?
+        .context("missing clone config")?;
+    config.extend_from_slice(
+        format!(
+            "[remote {}]\n\turl = {}\n\tfetch = {}\n[branch {}]\n\tremote = {}\n\tmerge = {}\n",
+            quote(options.remote),
+            quote(&url),
+            quote(&refspec),
+            quote(&branch),
+            quote(options.remote),
+            quote(&format!("refs/heads/{branch}")),
+        )
+        .as_bytes(),
+    );
+    repo.atomic("config", &config)?;
     if let Some(filter) = options.filter {
         let mut config = repo.read("config", 8 * 1024 * 1024)?.unwrap();
         config.extend_from_slice(

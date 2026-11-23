@@ -217,7 +217,7 @@ async fn run_inner(
         let entry = Entry {
             flags: 0,
             mode: 0o100644,
-            oid: obj.oid()?,
+            oid: obj.oid_for(repo.format)?,
         };
         after_index.insert(modules.clone(), entry);
         let mut after = before.clone();
@@ -235,7 +235,7 @@ async fn run_inner(
             store,
             Edit {
                 head: repo.head()?,
-                tip: repo.read_ref("HEAD")?.unwrap_or(Oid::ZERO),
+                tip: repo.read_ref("HEAD")?.unwrap_or(repo.format.zero()),
                 before,
                 after,
                 index_before: staged,
@@ -316,6 +316,7 @@ async fn run_inner(
                 let sub = Repo::open(&destination)?;
                 let mut objects = Store::new(&sub);
                 let ad = network::discover(endpoint, &cli.auth()?).await?;
+                ensure!(ad.format() == sub.format, "fetch object format mismatch");
                 let refs = ad
                     .refs
                     .into_iter()

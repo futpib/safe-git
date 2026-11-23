@@ -34,7 +34,7 @@ pub fn index_full(repo: &Repo) -> Result<(Entries, index::Conflicts)> {
         .map(|v| v.unwrap_or_default())
 }
 pub fn tree(store: &mut Store<'_>, id: Oid) -> Result<Entries> {
-    if id.to_string() == revision::EMPTY_TREE {
+    if id == store.format().empty_tree()? {
         Ok(Entries::new())
     } else {
         let id = revision::peel(store, id)?;
@@ -90,7 +90,7 @@ pub fn write_tree(repo: &Repo, entries: &Entries) -> Result<Oid> {
             data,
         };
         repo.write_object(&obj)?;
-        obj.oid()
+        obj.oid_for(repo.format)
     }
     build(
         repo,
@@ -166,7 +166,7 @@ pub(crate) fn new_commit(
         data,
     };
     repo.write_object(&object)?;
-    object.oid()
+    object.oid_for(repo.format)
 }
 #[derive(Default)]
 pub struct CommitOptions {
@@ -332,7 +332,9 @@ pub fn commit(
         ),
     )?;
     // Commit records a snapshot. Never check it out over subsequent or unstaged edits.
-    index_lock.file.write_all(&index::encode(&index_after)?)?;
+    index_lock
+        .file
+        .write_all(&index::encode_for(&index_after, repo.format)?)?;
     index_lock.commit("index")?;
     ref_lock.commit(id)?;
     crate::history::finish_logs(logs)?;
@@ -545,7 +547,7 @@ pub(crate) fn three_way(
                 kind: Kind::Blob,
                 data,
             };
-            let oid = object.oid()?;
+            let oid = object.oid_for(repo.format)?;
             repo.write_object(&object)?;
             Some(Entry {
                 flags: 0,

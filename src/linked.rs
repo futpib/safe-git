@@ -438,7 +438,7 @@ fn list_entry(repo: &Repo, path: &Path, metadata: &File, machine: bool, bare: bo
         if bare {
             println!("bare\n");
         } else {
-            println!("HEAD {}", id.unwrap_or(crate::object::Oid::ZERO));
+            println!("HEAD {}", id.unwrap_or(repo.format.zero()));
             if let Some(branch) = branch {
                 println!("branch {}\n", crate::compat::text(branch));
             } else {

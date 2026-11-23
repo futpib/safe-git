@@ -239,7 +239,7 @@ pub fn select(
             kind: Kind::Blob,
             data,
         };
-        let oid = object.oid()?;
+        let oid = object.oid_for(repo.format)?;
         repo.write_object(&object)?;
         result.insert(
             path.clone(),

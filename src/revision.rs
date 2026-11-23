@@ -5,14 +5,13 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::collections::{HashSet, VecDeque};
-pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 pub fn peel(store: &mut impl ReadObjects, mut id: Oid) -> Result<Oid> {
     for _ in 0..32 {
         let object = store.get(id)?;
         if object.kind != Kind::Tag {
             return Ok(id);
         }
-        let (target, kind) = object.children()?[0];
+        let (target, kind) = object.children_for(id.format())?[0];
         ensure!(store.get(target)?.kind == kind, "tag target type mismatch");
         id = target;
     }
@@ -50,8 +49,8 @@ pub fn upstream(repo: &Repo) -> Result<String> {
 }
 pub fn resolve(repo: &Repo, store: &mut Store<'_>, value: &str) -> Result<Oid> {
     ensure!(value.len() <= 4096 && !value.is_empty(), "invalid revision");
-    if value == EMPTY_TREE {
-        return Oid::parse(value.as_bytes());
+    if value == repo.format.empty_tree()?.to_string() {
+        return repo.format.empty_tree();
     }
     if let Some(base) = value.strip_suffix("^{commit}") {
         let id = resolve(repo, store, base)?;
@@ -124,13 +123,17 @@ pub fn resolve(repo: &Repo, store: &mut Store<'_>, value: &str) -> Result<Oid> {
             .rev()
             .nth(n)
             .context("reflog entry does not exist")?;
-        return Oid::parse(&line[41..81]);
+        return Ok(crate::history::log_ids(line)?.1);
     }
     if value == "FETCH_HEAD" {
         let bytes = repo
             .read("FETCH_HEAD", 8 * 1024 * 1024)?
             .context("missing FETCH_HEAD")?;
-        return Oid::parse(bytes.get(..40).context("invalid FETCH_HEAD")?);
+        return Oid::parse(
+            bytes
+                .get(..repo.format.hex_len())
+                .context("invalid FETCH_HEAD")?,
+        );
     }
     if value == "HEAD" || value == "@" {
         return repo.read_ref("HEAD")?.context("unborn HEAD");
@@ -138,7 +141,7 @@ pub fn resolve(repo: &Repo, store: &mut Store<'_>, value: &str) -> Result<Oid> {
     if value == "AUR_SEEN" {
         return repo.read_ref(value)?.context("unknown revision AUR_SEEN");
     }
-    if value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if value.len() == repo.format.hex_len() && value.bytes().all(|b| b.is_ascii_hexdigit()) {
         let id = Oid::parse(value.as_bytes())?;
         store.get(id)?;
         return Ok(id);
@@ -171,7 +174,9 @@ pub fn resolve(repo: &Repo, store: &mut Store<'_>, value: &str) -> Result<Oid> {
     if let Some(id) = found {
         return Ok(id);
     }
-    if (4..40).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if (4..repo.format.hex_len()).contains(&value.len())
+        && value.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         let matches = store
             .ids()?
             .into_iter()

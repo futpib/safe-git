@@ -196,6 +196,7 @@ async fn http_ad(client: &reqwest::Client, base: &url::Url) -> Result<(Advertise
 fn local_ad(repo: &Repo) -> Result<Advertisement> {
     let refs = repo.refs()?;
     let mut ad = Advertisement::new();
+    ad.set_format(repo.format)?;
     if let Some(id) = repo.read_ref("HEAD")? {
         ad.line(
             format!("{id} HEAD\0symref=HEAD:{}\n", repo.head()?).as_bytes(),
@@ -347,7 +348,7 @@ pub async fn fetch_options(
                 haves,
             )?;
             Ok(Fetched {
-                objects: protocol::decode_pack(bytes, haves)?,
+                objects: protocol::decode_pack(bytes, haves, ad.format())?,
                 shallow,
             })
         }
@@ -388,7 +389,7 @@ pub async fn fetch_options(
                 haves,
             )?;
             Ok(Fetched {
-                objects: protocol::decode_pack(bytes, haves)?,
+                objects: protocol::decode_pack(bytes, haves, ad.format())?,
                 shallow,
             })
         }
@@ -707,6 +708,7 @@ impl Push {
                 );
                 let old = repo.read_ref(name)?;
                 let mut advertisement = Advertisement::new();
+                advertisement.set_format(repo.format)?;
                 if let Some(old) = old {
                     advertisement.refs.insert(name.into(), old);
                 }
@@ -756,14 +758,15 @@ impl Push {
             Self::Local {
                 repo, name, old, ..
             } => {
+                ensure!(new.format() == repo.format, "push object format mismatch");
                 let _head_locks = local_push_locks(&repo, &name)?;
-                if new == Oid::ZERO {
+                if new.is_zero() {
                     if let Some(old) = old {
                         repo.delete_ref(&name, old)?;
                     }
                     return Ok(());
                 }
-                let objects = crate::pack::decode(&pack)?;
+                let objects = crate::pack::decode_for(&pack, repo.format)?;
                 let mut store = Store::new(&repo);
                 store.allow_promisor = false;
                 store.add(objects)?;

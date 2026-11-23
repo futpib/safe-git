@@ -11,20 +11,116 @@ pub const MAX_TOTAL: usize = 512 * 1024 * 1024;
 pub const MAX_OBJECTS: usize = 200_000;
 pub const MAX_PACK: usize = 256 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub enum Format {
+    #[default]
+    Sha1,
+    Sha256,
+}
+impl Format {
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+        }
+    }
+    pub fn hex_len(self) -> usize {
+        self.bytes() * 2
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+        }
+    }
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "sha1" => Ok(Self::Sha1),
+            "sha256" => Ok(Self::Sha256),
+            _ => bail!("unsupported object format"),
+        }
+    }
+    pub fn empty_tree(self) -> Result<Oid> {
+        hash_for(self, &[b"tree 0\0"])
+    }
+    pub fn zero(self) -> Oid {
+        match self {
+            Self::Sha1 => Oid::ZERO,
+            Self::Sha256 => Oid(HashBytes::Sha256([0; 32])),
+        }
+    }
+}
 #[derive(
     Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
 )]
-pub struct Oid(pub [u8; 20]);
+#[serde(untagged)]
+pub enum HashBytes {
+    Sha1([u8; 20]),
+    Sha256([u8; 32]),
+}
+impl AsRef<[u8]> for HashBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Sha1(v) => v,
+            Self::Sha256(v) => v,
+        }
+    }
+}
+impl std::ops::Deref for HashBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+impl IntoIterator for HashBytes {
+    type Item = u8;
+    type IntoIter = std::vec::IntoIter<u8>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_ref().to_vec().into_iter()
+    }
+}
+impl PartialEq<[u8]> for HashBytes {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.as_ref() == other
+    }
+}
+impl PartialEq<HashBytes> for [u8] {
+    fn eq(&self, other: &HashBytes) -> bool {
+        self == other.as_ref()
+    }
+}
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+pub struct Oid(pub HashBytes);
 impl Oid {
-    pub const ZERO: Self = Self([0; 20]);
+    pub const ZERO: Self = Self(HashBytes::Sha1([0; 20]));
+    #[cfg(test)]
+    pub const fn sha1(bytes: [u8; 20]) -> Self {
+        Self(HashBytes::Sha1(bytes))
+    }
+    pub fn format(self) -> Format {
+        match self.0 {
+            HashBytes::Sha1(_) => Format::Sha1,
+            HashBytes::Sha256(_) => Format::Sha256,
+        }
+    }
+    pub fn is_zero(self) -> bool {
+        self.0.iter().all(|b| *b == 0)
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(Self(match bytes.len() {
+            20 => HashBytes::Sha1(bytes.try_into()?),
+            32 => HashBytes::Sha256(bytes.try_into()?),
+            _ => bail!("invalid object ID length"),
+        }))
+    }
     pub fn parse(s: &[u8]) -> Result<Self> {
         ensure!(
-            s.len() == 40 && s.iter().all(u8::is_ascii_hexdigit),
-            "expected a SHA-1 object ID"
+            matches!(s.len(), 40 | 64) && s.iter().all(u8::is_ascii_hexdigit),
+            "expected a SHA-1 or SHA-256 object ID"
         );
-        let mut bytes = [0; 20];
-        hex::decode_to_slice(s, &mut bytes)?;
-        Ok(Self(bytes))
+        Self::from_bytes(&hex::decode(s)?)
     }
 }
 impl fmt::Display for Oid {
@@ -32,17 +128,25 @@ impl fmt::Display for Oid {
         write!(f, "{}", hex::encode(self.0))
     }
 }
-
 pub fn hash(parts: &[&[u8]]) -> Result<Oid> {
-    let mut h = Sha1::new();
-    for part in parts {
-        Digest::update(&mut h, part);
+    hash_for(Format::Sha1, parts)
+}
+pub fn hash_for(format: Format, parts: &[&[u8]]) -> Result<Oid> {
+    if format == Format::Sha256 {
+        use sha2::Digest;
+        let mut hash = sha2::Sha256::new();
+        for part in parts {
+            hash.update(part);
+        }
+        return Oid::from_bytes(&hash.finalize());
     }
-    let result = h.try_finalize();
+    let mut hash = Sha1::new();
+    for part in parts {
+        Digest::update(&mut hash, part);
+    }
+    let result = hash.try_finalize();
     ensure!(!result.has_collision(), "SHA-1 collision detected");
-    let mut bytes = [0; 20];
-    bytes.copy_from_slice(result.hash());
-    Ok(Oid(bytes))
+    Oid::from_bytes(result.hash())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,9 +190,13 @@ pub struct Object {
     pub data: Vec<u8>,
 }
 impl Object {
+    #[cfg(test)]
     pub fn oid(&self) -> Result<Oid> {
+        self.oid_for(Format::Sha1)
+    }
+    pub fn oid_for(&self, format: Format) -> Result<Oid> {
         let header = format!("{} {}\0", self.kind.name(), self.data.len());
-        hash(&[header.as_bytes(), &self.data])
+        hash_for(format, &[header.as_bytes(), &self.data])
     }
     pub fn commit(&self) -> Result<(Oid, Vec<Oid>)> {
         ensure!(
@@ -113,15 +221,22 @@ impl Object {
             ensure!(!line.starts_with(b"tree "), "duplicate tree header");
             if let Some(parent) = line.strip_prefix(b"parent ") {
                 ensure!(parents.len() < 4096, "too many commit parents");
-                parents.push(Oid::parse(parent)?);
+                let parent = Oid::parse(parent)?;
+                ensure!(
+                    parent.format() == tree.format(),
+                    "mixed commit object formats"
+                );
+                parents.push(parent);
             }
         }
         Ok((tree, parents))
     }
-    pub fn children(&self) -> Result<Vec<(Oid, Kind)>> {
+    pub fn children_for(&self, format: Format) -> Result<Vec<(Oid, Kind)>> {
+        let hash_len = format.bytes();
         match self.kind {
             Kind::Commit => {
                 let (tree, parents) = self.commit()?;
+                ensure!(tree.format() == format, "commit object format mismatch");
                 let mut out = vec![(tree, Kind::Tree)];
                 out.extend(parents.into_iter().map(|p| (p, Kind::Commit)));
                 Ok(out)
@@ -145,9 +260,8 @@ impl Object {
                         !name.is_empty() && !name.contains(&b'/') && name != b"." && name != b"..",
                         "invalid tree entry name"
                     );
-                    ensure!(rest.len() >= nul + 21, "truncated tree ID");
-                    let mut id = [0; 20];
-                    id.copy_from_slice(&rest[nul + 1..nul + 21]);
+                    ensure!(rest.len() >= nul + 1 + hash_len, "truncated tree ID");
+                    let id = Oid::from_bytes(&rest[nul + 1..nul + 1 + hash_len])?;
                     let kind = match mode {
                         b"40000" | b"040000" => Some(Kind::Tree),
                         b"100644" | b"100755" | b"120000" => Some(Kind::Blob),
@@ -155,9 +269,9 @@ impl Object {
                         _ => bail!("unsupported tree mode"),
                     };
                     if let Some(kind) = kind {
-                        out.push((Oid(id), kind));
+                        out.push((id, kind));
                     }
-                    data = &rest[nul + 21..];
+                    data = &rest[nul + 1 + hash_len..];
                 }
                 Ok(out)
             }
@@ -194,6 +308,7 @@ impl Object {
                         .is_some_and(|name| !name.is_empty()),
                     "tag has no name"
                 );
+                ensure!(id.format() == format, "tag object format mismatch");
                 Ok(vec![(id, kind)])
             }
         }
@@ -202,6 +317,7 @@ impl Object {
 
 pub type Objects = HashMap<Oid, Arc<Object>>;
 pub trait ReadObjects {
+    fn format(&self) -> Format;
     fn get(&mut self, oid: Oid) -> Result<Arc<Object>>;
     fn parents(&mut self, oid: Oid) -> Result<Vec<Oid>> {
         Ok(self.get(oid)?.commit()?.1)
@@ -247,7 +363,7 @@ pub fn reachable_many_since(
             .checked_add(obj.data.len())
             .ok_or_else(|| anyhow::anyhow!("size overflow"))?;
         ensure!(bytes <= MAX_TOTAL, "reachable objects exceed byte limit");
-        let mut children = obj.children()?;
+        let mut children = obj.children_for(oid.format())?;
         if obj.kind == Kind::Commit && store.shallow(oid) {
             children.retain(|(_, kind)| *kind != Kind::Commit);
         }
@@ -302,4 +418,20 @@ pub fn ancestor(store: &mut impl ReadObjects, old: Oid, new: Oid) -> Result<bool
         pending.extend(parents);
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn id_serialization_keeps_existing_journals_readable() {
+        for format in [Format::Sha1, Format::Sha256] {
+            let bytes = vec![17u8; format.bytes()];
+            let id = Oid::from_bytes(&bytes).unwrap();
+            let original = serde_json::to_vec(&bytes).unwrap();
+            assert_eq!(serde_json::to_vec(&id).unwrap(), original);
+            assert_eq!(serde_json::from_slice::<Oid>(&original).unwrap(), id);
+        }
+        assert!(serde_json::from_slice::<Oid>(&serde_json::to_vec(&vec![0; 21]).unwrap()).is_err());
+    }
 }
