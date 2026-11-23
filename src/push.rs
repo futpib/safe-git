@@ -9,6 +9,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeSet, HashMap};
 pub struct Options<'a> {
+    pub dry_run: bool,
     pub url: Option<&'a str>,
     pub specs: &'a [String],
     pub upstream: bool,
@@ -177,6 +178,17 @@ pub async fn run(
                 ancestor(store, old, tip)?,
                 "non-fast-forward push refused; destination is unchanged"
             );
+        }
+        if options.dry_run {
+            if !cli.quiet {
+                eprintln!(
+                    "Would push {} -> {}{}",
+                    crate::compat::text(&source),
+                    crate::compat::text(&dest),
+                    if tip == Oid::ZERO { " (delete)" } else { "" }
+                );
+            }
+            continue;
         }
         if old != Some(tip) && !(old.is_none() && tip == Oid::ZERO) {
             let objects = if tip == Oid::ZERO {

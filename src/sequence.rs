@@ -10,16 +10,15 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeSet,
-    io::{BufRead, Read, Write},
-};
+use std::collections::{BTreeMap, BTreeSet};
 const STATE: &str = "safe-git-sequence";
 #[derive(Clone, Serialize, Deserialize)]
-struct Step {
-    id: Oid,
-    action: String,
-    message: Option<String>,
+pub(crate) struct Step {
+    pub(crate) id: Oid,
+    pub(crate) action: String,
+    pub(crate) message: Option<String>,
+    #[serde(default)]
+    pub(crate) targets: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -36,6 +35,10 @@ struct State {
     mainline: Option<usize>,
     no_commit: bool,
     merge_parent: Option<Oid>,
+    #[serde(default)]
+    labels: BTreeMap<String, Oid>,
+    #[serde(default)]
+    rebase_parents: Vec<Oid>,
 }
 fn save(repo: &Repo, state: &State) -> Result<()> {
     let bytes = serde_json::to_vec(state)?;
@@ -63,10 +66,32 @@ fn load(repo: &Repo) -> Result<State> {
         ensure!(
             matches!(
                 step.action.as_str(),
-                "pick" | "reword" | "edit" | "squash" | "fixup" | "drop"
+                "pick"
+                    | "reword"
+                    | "edit"
+                    | "squash"
+                    | "fixup"
+                    | "drop"
+                    | "label"
+                    | "reset"
+                    | "merge"
+                    | "break"
             ),
             "unsupported sequence action; commands are never executed"
         );
+    }
+    ensure!(
+        state.labels.len() <= crate::object::MAX_OBJECTS * 2 && state.rebase_parents.len() <= 32,
+        "sequence graph exceeds limit"
+    );
+    for label in state.labels.keys() {
+        crate::rebase_plan::label(label)?;
+    }
+    for step in &state.steps {
+        ensure!(step.targets.len() <= 32, "too many merge targets");
+        for target in &step.targets {
+            crate::rebase_plan::label(target)?;
+        }
     }
     ensure!(repo.head()? == state.branch, "sequence branch changed");
     Ok(state)
@@ -241,6 +266,8 @@ fn create(
         }
         message = prior;
         previous.commit()?.1
+    } else if !state.rebase_parents.is_empty() {
+        state.rebase_parents.clone()
     } else if let Some(other) = state.merge_parent {
         vec![state.current, other]
     } else {
@@ -268,7 +295,15 @@ fn create(
     )?;
     repo.update_ref(&state.branch, Some(state.current), id)?;
     crate::history::finish_logs(logs)?;
+    if squash {
+        for value in state.labels.values_mut() {
+            if *value == state.current {
+                *value = id;
+            }
+        }
+    }
     state.current = id;
+    state.rebase_parents.clear();
     state.pending = false;
     state.next += 1;
     state.editing = step.action == "edit";
@@ -277,14 +312,54 @@ fn create(
 fn advance(cli: &Cli, repo: &Repo, store: &mut Store<'_>, state: &mut State) -> Result<()> {
     while state.next < state.steps.len() {
         let step = state.steps[state.next].clone();
+        if step.action == "break" {
+            state.next += 1;
+            state.editing = true;
+            save(repo, state)?;
+            println!("Stopped at break; run rebase --continue.");
+            return Ok(());
+        }
         if step.action == "drop" {
+            state.next += 1;
+            save(repo, state)?;
+            continue;
+        }
+        if step.action == "label" || step.action == "reset" {
+            let target = step.targets.first().context("missing rebase label")?;
+            crate::rebase_plan::label(target)?;
+            if step.action == "label" {
+                ensure!(!state.labels.contains_key(target), "duplicate rebase label");
+                state.labels.insert(target.clone(), state.current);
+            } else {
+                let id = *state.labels.get(target).context("unknown rebase label")?;
+                clean(repo, store, state.current)?;
+                porcelain::reset(repo, store, id, true)?;
+                state.current = id;
+            }
             state.next += 1;
             save(repo, state)?;
             continue;
         }
         let object = store.get(step.id)?;
         let parents = object.commit()?.1;
-        let (base, theirs) = if state.kind == "merge" {
+        let (base, theirs) = if step.action == "merge" {
+            ensure!(
+                state.kind == "rebase" && !step.targets.is_empty(),
+                "invalid rebase merge"
+            );
+            let others = step
+                .targets
+                .iter()
+                .map(|l| state.labels.get(l).copied().context("unknown merge label"))
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(others.len() == 1, "octopus rebase merges are unsupported");
+            state.rebase_parents = vec![state.current, others[0]];
+            let base = revision::merge_base(store, state.current, others[0])?;
+            (
+                porcelain::tree(store, base)?,
+                porcelain::tree(store, others[0])?,
+            )
+        } else if state.kind == "merge" {
             {
                 let base = revision::merge_base(store, state.current, step.id)?;
                 (
@@ -385,6 +460,7 @@ fn control(cli: &Cli, repo: &Repo, store: &mut Store<'_>, kind: &str, action: &s
             porcelain::reset(repo, store, state.current, true)?;
             state.next += 1;
             state.pending = false;
+            state.rebase_parents.clear();
             save(repo, &state)?;
         } else {
             let step = state
@@ -408,63 +484,6 @@ fn control(cli: &Cli, repo: &Repo, store: &mut Store<'_>, kind: &str, action: &s
     }
     advance(cli, repo, store, &mut state)
 }
-fn interactive(steps: Vec<Step>) -> Result<Vec<Step>> {
-    for step in &steps {
-        println!("{} {}", step.action, step.id);
-    }
-    println!(
-        "Enter pick/reword/edit/squash/fixup/drop COMMIT [message] lines, then done. Enter done alone to keep this order. Commands and editors are never run."
-    );
-    std::io::stdout().flush()?;
-    let mut chosen = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut input = std::io::stdin().lock();
-    loop {
-        let mut line = String::new();
-        let n = (&mut input).take(8193).read_line(&mut line)?;
-        ensure!(n > 0 && n <= 8192, "missing or oversized rebase plan line");
-        let line = line.trim();
-        if line == "done" {
-            break;
-        }
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut words = line.splitn(3, ' ');
-        let action = words.next().unwrap();
-        let id = words.next().context("rebase action needs a commit")?;
-        let action = match action {
-            "p" | "pick" => "pick",
-            "r" | "reword" => "reword",
-            "e" | "edit" => "edit",
-            "s" | "squash" => "squash",
-            "f" | "fixup" => "fixup",
-            "d" | "drop" => "drop",
-            _ => bail!("unsupported rebase action; exec and scripts are never run"),
-        };
-        let matches: Vec<_> = steps
-            .iter()
-            .filter(|s| id.len() >= 4 && s.id.to_string().starts_with(id))
-            .collect();
-        ensure!(matches.len() == 1, "unknown or ambiguous plan commit");
-        let mut step = matches[0].clone();
-        ensure!(seen.insert(step.id.to_string()), "duplicate plan commit");
-        step.action = action.into();
-        step.message = words.next().map(str::to_owned);
-        ensure!(
-            action != "reword" || step.message.as_ref().is_some_and(|m| !m.trim().is_empty()),
-            "reword requires a message on the plan line"
-        );
-        ensure!(
-            !matches!(action, "squash" | "fixup")
-                || chosen.iter().any(|s: &Step| s.action != "drop"),
-            "cannot squash the first commit"
-        );
-        chosen.push(step);
-        ensure!(chosen.len() <= steps.len(), "plan exceeds history");
-    }
-    Ok(if chosen.is_empty() { steps } else { chosen })
-}
 pub fn run(
     cli: &Cli,
     repo: &Repo,
@@ -484,6 +503,8 @@ pub fn run(
     let mut interactive_rebase = false;
     let mut onto = None;
     let mut autosquash = false;
+    let mut preserve = false;
+    let mut cousins = false;
     let mut values = Vec::new();
     let mut items = args.iter();
     while let Some(arg) = items.next() {
@@ -495,6 +516,15 @@ pub fn run(
             }
             a if kind == "rebase" && a.starts_with("--onto=") => onto = Some(&a[7..]),
             "--autosquash" if kind == "rebase" => autosquash = true,
+            "-r" | "--rebase-merges" | "--rebase-merges=no-rebase-cousins" if kind == "rebase" => {
+                preserve = true;
+                cousins = false;
+            }
+            "--rebase-merges=rebase-cousins" if kind == "rebase" => {
+                preserve = true;
+                cousins = true;
+            }
+            "--no-rebase-merges" if kind == "rebase" => preserve = false,
             "-m" | "--mainline" => {
                 mainline = Some(items.next().context("missing mainline")?.parse::<usize>()?)
             }
@@ -525,6 +555,8 @@ pub fn run(
         mainline,
         no_commit,
         merge_parent: None,
+        labels: BTreeMap::new(),
+        rebase_parents: Vec::new(),
     };
     if kind == "rebase" {
         ensure!(values.len() <= 1, "rebase accepts one upstream");
@@ -551,11 +583,12 @@ pub fn run(
             }
             let parents = store.parents(id)?;
             if expanded {
-                if parents.len() <= 1 {
+                if parents.len() <= 1 || preserve {
                     state.steps.push(Step {
                         id,
-                        action: "pick".into(),
+                        action: if parents.len() > 1 { "merge" } else { "pick" }.into(),
                         message: None,
+                        targets: Vec::new(),
                     });
                 }
                 continue;
@@ -574,8 +607,14 @@ pub fn run(
         if autosquash {
             state.steps = squash_plan(store, state.steps)?;
         }
+        state.labels.insert("onto".into(), incoming);
+        if preserve {
+            let fork = revision::merge_base(store, original, excluded_tip)?;
+            state.steps =
+                crate::rebase_plan::graph(store, state.steps, fork, cousins, &mut state.labels)?;
+        }
         if interactive_rebase {
-            state.steps = interactive(state.steps)?;
+            state.steps = crate::rebase_plan::interactive(state.steps, &state.labels)?;
         }
         if Some(incoming) == base && !interactive_rebase && !autosquash && onto.is_none() {
             return Ok(());
@@ -591,6 +630,7 @@ pub fn run(
                 id: revision::commit(repo, store, value)?,
                 action: "pick".into(),
                 message: None,
+                targets: Vec::new(),
             });
         }
         save(repo, &state)?;
@@ -624,6 +664,7 @@ pub fn merge(
             id: incoming,
             action: "pick".into(),
             message: None,
+            targets: Vec::new(),
         }],
         next: 0,
         pending: false,
@@ -632,6 +673,8 @@ pub fn merge(
         mainline: None,
         no_commit,
         merge_parent: Some(incoming),
+        labels: BTreeMap::new(),
+        rebase_parents: Vec::new(),
     };
     save(repo, &state)?;
     // A no-commit merge remains resumable; ordinary cherry-pick -n does not.

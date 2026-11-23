@@ -4,18 +4,30 @@ Everyday editing includes init, clone/fetch/pull/push, branches, switch, status,
 add/restore (including selected hunks), rm/mv/clean, commit/amend, reset, reflog,
 and stash. Directory moves preserve untracked files and unstaged edits; clean
 requires an explicit force request or dry run.
+Status accepts paths. Commits accept message files/stdin and --fixup; global
+config reads inert values and writes user.name/user.email without needing a repo.
 
 Inspection includes show, blame, path-filtered log, --all/--graph/--decorate,
-three-dot diffs, and lightweight/annotated tag creation, listing, and deletion.
+--author/--grep filters, tracked-file grep, diff --check/--name-status, three-dot
+diffs, and lightweight/annotated tag creation, listing, and deletion.
 Merge, cherry-pick, revert, and rebase support conflicts and continue/abort.
-Pull supports --rebase; rebase supports --onto and --autosquash. Interactive
-rebase reads pick/reword/edit/squash/fixup/drop plans from stdin; it never opens
-an editor or executes a plan command. Rebase flattens local merges. Bisect
+Pull supports --rebase; rebase supports --onto, --autosquash, and --rebase-merges
+for two-parent merges. Interactive rebase displays its proposed plan and reads
+pick/reword/edit/squash/fixup/drop/break and label/reset/merge actions from stdin.
+Enter `done` to submit; `done` alone keeps the proposed plan. Reword messages go
+on the action line; `merge -c` takes `# MESSAGE`. No editor or exec action runs.
+Plain rebase flattens merges. Bisect
 supports start/good/bad/skip/log/reset, without executing test commands.
+
+Apply handles unified text and Git binary patches, --check, --index, --cached,
+and --reverse. Format-patch exports mailboxes or files; am imports UTF-8 inline
+mail and supports --continue/--skip/--abort. Encoded MIME bodies/headers, copy
+patches, and gitlink patches are rejected. Patch paths use checkout's safeguards.
 
 Clone --depth negotiates shallow history; fetch --unshallow restores it.
 Fetch supports SSH, HTTP(S), native git://, and local objects. Push supports
 SSH/HTTP(S), branches/tags, deletion, explicit force, and force-with-lease.
+Push --dry-run checks the destination without sending updates or saving upstreams.
 Caller-provided SAFE_GIT_HTTP_TOKEN is sent only over HTTPS. Redirects and
 credential helpers are never followed.
 

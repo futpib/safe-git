@@ -26,7 +26,7 @@ pub fn run(
     args: &[String],
 ) -> Result<()> {
     match name {
-        "status" => status(repo, store, args),
+        "status" => status(cli, repo, store, args),
         "add" => add(cli, repo, args),
         "restore" => restore(cli, repo, store, args),
         "switch" => switch(cli, repo, store, args),
@@ -737,10 +737,16 @@ fn switch(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Res
     }
 }
 
-fn status(repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Result<()> {
+fn status(cli: &Cli, repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Result<()> {
     let (mut short, mut nul, mut branch, mut v2) = (false, false, false, false);
     let mut untracked_mode = "normal";
+    let mut names = Vec::new();
+    let mut end = false;
     for arg in args {
+        if end {
+            names.push(arg.clone());
+            continue;
+        }
         match arg.as_str() {
             "-s" | "--short" | "--porcelain" | "--porcelain=v1" => short = true,
             "--porcelain=v2" => {
@@ -761,15 +767,22 @@ fn status(repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Result<()> {
                 untracked_mode = "all"
             }
             "-unormal" | "--untracked-files=normal" => untracked_mode = "normal",
-            _ => bail!("unsupported status option {arg}"),
+            "--" => end = true,
+            a if a.starts_with('-') => bail!("unsupported status option {arg}"),
+            _ => names.push(arg.clone()),
         }
     }
-    let (staged, conflicts) = porcelain::index_full(repo)?;
+    let specs = if names.is_empty() {
+        vec![Vec::new()]
+    } else {
+        paths(&names, &cli.prefix)?
+    };
+    let (staged, mut conflicts) = porcelain::index_full(repo)?;
     let before = index::tree(store, repo.read_ref("HEAD")?)?;
     let work = Work::new(repo)?;
     let mut rows = Vec::new();
     for path in before.keys().chain(staged.keys()).collect::<BTreeSet<_>>() {
-        if conflicts.contains_key(path) {
+        if !selected(path, &specs) || conflicts.contains_key(path) {
             continue;
         }
         let a = before.get(path).copied();
@@ -868,10 +881,13 @@ fn status(repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Result<()> {
     }
     if untracked_mode != "no" {
         let mut names = BTreeSet::new();
-        for mut path in untracked(repo, &tracked, &[Vec::new()], false)? {
+        for mut path in untracked(repo, &tracked, &specs, false)? {
             if untracked_mode == "normal" {
                 for i in 0..path.len() {
-                    if path[i] == b'/' && !tracked.keys().any(|p| p.starts_with(&path[..=i])) {
+                    if path[i] == b'/'
+                        && selected(&path[..i], &specs)
+                        && !tracked.keys().any(|p| p.starts_with(&path[..=i]))
+                    {
                         path.truncate(i + 1);
                         break;
                     }
@@ -885,6 +901,7 @@ fn status(repo: &Repo, store: &mut Store<'_>, args: &[String]) -> Result<()> {
                 .map(|p| ('?', '?', p, None, 100, None, None, None)),
         );
     }
+    conflicts.retain(|p, _| selected(p, &specs));
     let head_name = repo.head()?;
     let head = head_name
         .strip_prefix("refs/heads/")

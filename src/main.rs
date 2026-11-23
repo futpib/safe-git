@@ -1,4 +1,5 @@
 mod archive;
+mod binary_patch;
 mod bisect;
 mod checkout;
 mod clone;
@@ -10,6 +11,7 @@ mod ignore;
 mod index;
 mod inspect;
 mod linked;
+mod mail;
 mod network;
 mod object;
 mod output;
@@ -19,9 +21,11 @@ mod patch;
 mod porcelain;
 mod protocol;
 mod push;
+mod rebase_plan;
 mod remotes;
 mod repo;
 mod revision;
+mod search;
 mod sequence;
 mod shallow;
 mod stash;
@@ -42,7 +46,7 @@ use transport::Auth;
 #[command(
     version = env!("SAFE_GIT_VERSION"),
     about = "Git operations without repository-directed execution",
-    after_help = "Everyday commands: status, add, switch, restore, diff, log, commit, stash.\nAdditional commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, branch, reset, reflog, checkout, rebase, cherry-pick, revert, tag, rev-list, describe,\narchive --format tar, show, blame, rm, mv, clean, remote, worktree, bisect, submodule. Unsupported options fail closed."
+    after_help = "Everyday commands: status, add, switch, restore, diff, log, commit, stash.\nAdditional commands: ls-remote, config, rev-parse, symbolic-ref, update-ref,\nmerge-base, branch, reset, reflog, checkout, rebase, cherry-pick, revert, tag, rev-list, describe,\narchive --format tar, show, blame, rm, mv, clean, remote, worktree, bisect, submodule, grep, apply, am, format-patch. Unsupported options fail closed."
 )]
 struct Cli {
     /// Repository or a directory within its working tree
@@ -167,6 +171,9 @@ enum Command {
     },
     /// Push branches or tags to a caller-selected or host-registered endpoint
     Push {
+        /// Validate the push without updating refs or upstreams
+        #[arg(short = 'n', long)]
+        dry_run: bool,
         /// Remember the destination in trusted host state, never repository config
         #[arg(short = 'u', long)]
         set_upstream: bool,
@@ -283,6 +290,11 @@ async fn run(cli: &Cli) -> Result<()> {
     ensure!(
         !repo.exists("safe-git-checkout")?,
         "interrupted checkout; run safe-git recover"
+    );
+    ensure!(
+        !repo.exists("safe-git-am")?
+            || !matches!(cli.command, Command::Pull { .. } | Command::Merge { .. }),
+        "am in progress; continue or abort it first"
     );
     let mut store = Store::new(&repo);
     match &cli.command {
@@ -429,6 +441,7 @@ async fn run(cli: &Cli) -> Result<()> {
             }
         }
         Command::Push {
+            dry_run,
             url,
             refspec,
             set_upstream,
@@ -442,6 +455,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 &repo,
                 &mut store,
                 push::Options {
+                    dry_run: *dry_run,
                     url: url.as_deref(),
                     specs: refspec,
                     upstream: *set_upstream,
@@ -614,7 +628,7 @@ async fn main() {
 
 fn locate(cli: &mut Cli) -> Result<()> {
     if matches!(cli.command, Command::Init { .. } | Command::Clone { .. })
-        || matches!(&cli.command,Command::Compatibility(args) if args.first().is_some_and(|a| a == "ls-remote"))
+        || matches!(&cli.command,Command::Compatibility(args) if args.first().is_some_and(|a| a == "ls-remote" || (a == "config" && args.iter().any(|a| a == "--global"))))
     {
         return Ok(());
     }

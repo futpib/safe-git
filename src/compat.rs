@@ -124,6 +124,9 @@ fn ready(repo: &Repo) -> Result<()> {
 pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
     let name = command.first().context("missing command")?.as_str();
     let items = &command[1..];
+    if name == "config" && flag(items, "--global") {
+        return config::global(items);
+    }
     if name == "ls-remote" {
         let pos = args(
             items,
@@ -217,7 +220,11 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             "remote",
             "worktree",
             "bisect",
-            "submodule"
+            "submodule",
+            "grep",
+            "apply",
+            "am",
+            "format-patch"
         ]
         .contains(&name),
         "unsupported Git command {name}; no external fallback is implemented"
@@ -233,8 +240,26 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             "operation in progress; continue or abort it first"
         );
     }
+    ensure!(
+        !repo.exists("safe-git-am")?
+            || matches!(
+                name,
+                "am" | "add"
+                    | "restore"
+                    | "apply"
+                    | "status"
+                    | "diff"
+                    | "log"
+                    | "show"
+                    | "grep"
+                    | "rev-parse"
+            ),
+        "am in progress; continue or abort it first"
+    );
     let mut store = Store::new(&repo);
     match name {
+        "grep" => crate::search::grep(cli, &repo, &mut store, items),
+        "apply" | "am" | "format-patch" => crate::mail::run(cli, &repo, &mut store, name, items),
         "show" | "blame" => crate::inspect::run(cli, &repo, &mut store, name, items),
         "rm" | "mv" | "clean" => crate::files::run(cli, &repo, &mut store, name, items),
         "remote" => crate::remotes::run(cli, &repo, &mut store, items).await,
@@ -463,7 +488,8 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
             crate::sequence::run(cli, &repo, &mut store, name, items)
         }
         "commit" => {
-            let mut message = None;
+            let mut message: Option<String> = None;
+            let mut fixup = None;
             let mut amend = false;
             let mut no_edit = false;
             let mut all = false;
@@ -474,8 +500,23 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                     "-am" | "-m" | "--message" => {
                         all |= items[i] == "-am";
                         i += 1;
-                        message = Some(items.get(i).context("missing commit message")?.as_str());
+                        message = Some(items.get(i).context("missing commit message")?.clone());
                     }
+                    "-F" | "--file" => {
+                        i += 1;
+                        message = Some(String::from_utf8(crate::mail::read_input(
+                            cli,
+                            items.get(i).context("missing message file")?,
+                        )?)?);
+                    }
+                    a if a.starts_with("--file=") => {
+                        message = Some(String::from_utf8(crate::mail::read_input(cli, &a[7..])?)?)
+                    }
+                    "--fixup" => {
+                        i += 1;
+                        fixup = Some(items.get(i).context("missing fixup revision")?.as_str());
+                    }
+                    a if a.starts_with("--fixup=") => fixup = Some(&a[8..]),
                     "--amend" => amend = true,
                     "--no-edit" => no_edit = true,
                     "-a" | "--all" => all = true,
@@ -484,11 +525,20 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                 }
                 i += 1;
             }
+            if let Some(value) = fixup {
+                ensure!(!amend, "--fixup and --amend are incompatible");
+                let id = revision::commit(&repo, &mut store, value)?;
+                let subject = porcelain::subject(&store.get(id)?.data);
+                message = Some(format!(
+                    "fixup! {subject}\n{}",
+                    message.map(|m| format!("\n{m}")).unwrap_or_default()
+                ));
+            }
             if amend {
                 crate::sequence::amend_allowed(&repo)?;
             }
             if !amend
-                && let Some(message) = message
+                && let Some(message) = message.as_deref()
                 && crate::sequence::commit_pending(cli, &repo, &mut store, message)?
             {
                 return Ok(());
@@ -509,7 +559,7 @@ pub async fn run(cli: &Cli, command: &[String]) -> Result<()> {
                 &repo,
                 &mut store,
                 &cli.config,
-                message.or(previous_message.as_deref()).context(
+                message.as_deref().or(previous_message.as_deref()).context(
                     "commit requires -m or --amend --no-edit; editors are not implemented",
                 )?,
                 porcelain::CommitOptions { all, quiet, amend },
@@ -736,6 +786,8 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
             "--no-color",
             "--no-ext-diff",
             "--name-only",
+            "--name-status",
+            "--check",
         ],
     )?;
     let staged = porcelain::index(repo)?;
@@ -793,7 +845,12 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
         after.retain(keep);
     }
     let changed = before != after;
-    if !flag(items, "--quiet") {
+    let mut whitespace_errors = false;
+    ensure!(
+        !flag(items, "--check") || !flag(items, "--exit-code"),
+        "--check and --exit-code are incompatible"
+    );
+    if !flag(items, "--quiet") || flag(items, "--check") {
         if flag(items, "--stat") {
             let stat = crate::output::diffstat_entries(store, &before, &after)?;
             for line in stat.lines() {
@@ -815,6 +872,24 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
             let a = before.get(path).copied();
             let b = after.get(path).copied();
             if a == b {
+                continue;
+            }
+            if flag(items, "--check") {
+                let old = crate::output::content(store, a, &mut budget)?;
+                let new = crate::output::content(store, b, &mut budget)?;
+                let (errors, diagnostics) = crate::mail::check_whitespace(path, &old, &new)?;
+                whitespace_errors |= errors;
+                output.push_str(&diagnostics);
+                continue;
+            }
+            if flag(items, "--name-status") {
+                let status = match (a, b) {
+                    (None, _) => 'A',
+                    (_, None) => 'D',
+                    (Some(a), Some(b)) if a.mode & 0o170000 != b.mode & 0o170000 => 'T',
+                    _ => 'M',
+                };
+                output.push_str(&format!("{status}\t{}\n", crate::output::quote(path)));
                 continue;
             }
             if flag(items, "--name-only") {
@@ -885,9 +960,17 @@ pub(crate) fn diff(repo: &Repo, store: &mut Store<'_>, items: &[String]) -> Resu
                 "diff output exceeds limit"
             );
         }
-        print!("{output}");
+        if !flag(items, "--quiet") {
+            print!("{output}");
+        }
     }
-    if flag(items, "--exit-code") || flag(items, "--quiet") {
+    if flag(items, "--check") {
+        if whitespace_errors {
+            Err(Exit(2).into())
+        } else {
+            Ok(())
+        }
+    } else if flag(items, "--exit-code") || flag(items, "--quiet") {
         predicate(!changed)
     } else {
         Ok(())
@@ -938,7 +1021,12 @@ pub(crate) fn history(
             normalized.push(item.clone());
             continue;
         }
-        if item == "-n" || item == "--max-count" {
+        if item == "--author" || item == "--grep" {
+            normalized.push(format!(
+                "{item}={}",
+                input.next().context("missing search pattern")?
+            ));
+        } else if item == "-n" || item == "--max-count" {
             let count = input.next().context("missing history count")?;
             count.parse::<usize>().context("invalid history count")?;
             normalized.push(format!("--max-count={count}"));
@@ -972,6 +1060,16 @@ pub(crate) fn history(
             "--decorate=",
             "--no-decorate",
             "--reverse",
+            "--author=",
+            "--grep=",
+            "-i",
+            "--regexp-ignore-case",
+            "-F",
+            "--fixed-strings",
+            "-E",
+            "--extended-regexp",
+            "--basic-regexp",
+            "--all-match",
         ],
     )?;
     let mut ids = crate::inspect::history_ids(
@@ -998,6 +1096,34 @@ pub(crate) fn history(
     if flag(items, "--reverse") {
         ids.reverse();
     }
+    let patterns = |prefix: &str| {
+        items
+            .iter()
+            .filter_map(|s| s.strip_prefix(prefix).map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    let fixed = flag(items, "-F") || flag(items, "--fixed-strings");
+    let extended = flag(items, "-E") || flag(items, "--extended-regexp");
+    let insensitive = flag(items, "-i") || flag(items, "--regexp-ignore-case");
+    let authors =
+        crate::search::Matcher::new(&patterns("--author="), fixed, extended, insensitive)?;
+    let messages = crate::search::Matcher::new(&patterns("--grep="), fixed, extended, insensitive)?;
+    let mut filtered = Vec::new();
+    for id in ids {
+        let object = store.get(id)?;
+        let author = porcelain::author(&object.data)?;
+        let message = porcelain::message(&object.data)?;
+        if authors.matches(author.as_bytes())
+            && if flag(items, "--all-match") {
+                messages.matches_all(message)
+            } else {
+                messages.matches(message)
+            }
+        {
+            filtered.push(id);
+        }
+    }
+    let ids = filtered;
     let decorate = (flag(items, "--decorate") || option(items, "--decorate=").is_some())
         && !flag(items, "--no-decorate");
     let decorations = if decorate {

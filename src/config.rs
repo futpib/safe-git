@@ -5,6 +5,112 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
+
+// This path comes only from the caller's environment, never from repository data.
+fn global_path() -> Result<std::path::PathBuf> {
+    std::env::var_os("GIT_CONFIG_GLOBAL")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|h| h.join(".gitconfig")))
+        .context("no global configuration path")
+}
+pub fn global(args: &[String]) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::{
+        ffi::OsStringExt,
+        fs::{MetadataExt, OpenOptionsExt},
+    };
+    let mut get = false;
+    let mut list = false;
+    let mut values = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--global" => {}
+            "--get" => get = true,
+            "--list" | "-l" => list = true,
+            a if a.starts_with('-') => anyhow::bail!("unsupported global config option {a}"),
+            _ => values.push(arg.as_str()),
+        }
+    }
+    ensure!(
+        (list && values.is_empty()) || (!list && (1..=2).contains(&values.len())),
+        "config requires a key and optional value"
+    );
+    ensure!(!get || values.len() == 1, "--get requires one key");
+    let path = global_path()?;
+    let mut bytes = Vec::new();
+    match std::fs::File::open(&path) {
+        Ok(file) => {
+            file.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let parsed = parse(&bytes)?;
+    if list {
+        for (key, value) in parsed {
+            println!(
+                "{}={}",
+                crate::compat::text(&key),
+                crate::compat::text(&value)
+            );
+        }
+        return Ok(());
+    }
+    if values.len() == 1 {
+        if let Some(value) = parsed.get(values[0]) {
+            println!("{}", crate::compat::text(value));
+            return Ok(());
+        }
+        return Err(crate::compat::Exit(1).into());
+    }
+    // Keep writes to identity settings. Includes, aliases and executable options remain inert.
+    ensure!(
+        matches!(values[0], "user.name" | "user.email"),
+        "global config writes support user.name and user.email"
+    );
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        ensure!(
+            meta.is_file() && meta.nlink() == 1,
+            "unsafe global config file"
+        );
+    }
+    let mut name = path.as_os_str().as_encoded_bytes().to_vec();
+    name.extend_from_slice(b".lock");
+    let lock_path = std::path::PathBuf::from(std::ffi::OsString::from_vec(name));
+    let mut lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&lock_path)?;
+    let result = (|| -> Result<()> {
+        let current = match std::fs::read(&path) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        ensure!(
+            current == bytes,
+            "global configuration changed concurrently"
+        );
+        bytes.extend_from_slice(
+            format!(
+                "\n[user]\n\t{} = {}\n",
+                values[0].strip_prefix("user.").unwrap(),
+                quote(values[1])
+            )
+            .as_bytes(),
+        );
+        ensure!(bytes.len() <= 8 * 1024 * 1024, "config exceeds limit");
+        lock.write_all(&bytes)?;
+        lock.sync_all()?;
+        std::fs::rename(&lock_path, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(lock_path);
+    }
+    result
+}
 pub fn parse(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
     ensure!(bytes.len() <= 8 * 1024 * 1024, "config exceeds limit");
     let mut values = BTreeMap::new();

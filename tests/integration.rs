@@ -2,6 +2,8 @@
 //! temporary sshd's forced command, keeping the entire fixture in Rust.
 #[path = "suites/bootstrap.rs"]
 mod bootstrap;
+#[path = "suites/completion.rs"]
+mod completion;
 #[path = "suites/extended.rs"]
 mod extended;
 #[path = "suites/gaps.rs"]
@@ -35,6 +37,22 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("completion_inspection", || {
+                completion::inspection();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("completion_patches", || {
+                completion::patches();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("completion_rebase", || {
+                completion::rebase();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("completion_push", || {
+                completion::push();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("gaps_edge_safety", || {
                 gaps::edge_safety();
                 Ok(())
