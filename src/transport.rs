@@ -15,6 +15,7 @@ pub struct Remote {
     pub port: u16,
     pub user: String,
     pub path: String,
+    pub(crate) explicit_port: bool,
 }
 impl Remote {
     pub fn parse(input: &str) -> Result<Self> {
@@ -41,26 +42,26 @@ impl Remote {
                 port: url.port().unwrap_or(22),
                 user: url.username().to_owned(),
                 path: url.path().to_owned(),
+                explicit_port: url.port().is_some(),
             }
         } else {
             ensure!(!input.contains("://"), "only SSH transport is supported");
-            let (user, rest) = input
-                .split_once('@')
-                .context("use user@host:path or ssh://user@host/path")?;
+            ensure!(!input.contains("::"), "remote helper syntax is unsupported");
+            let (user, rest) = input.split_once('@').unwrap_or(("", input));
             let (host, path) = rest.split_once(':').context("SSH URL has no path")?;
             Self {
                 user: user.to_owned(),
                 host: host.to_owned(),
                 port: 22,
                 path: path.to_owned(),
+                explicit_port: false,
             }
         };
         ensure!(
-            !remote.user.is_empty()
-                && remote
-                    .user
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+            remote
+                .user
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
             "invalid SSH username"
         );
         ensure!(
@@ -93,6 +94,7 @@ pub struct Auth {
     pub identity: Option<PathBuf>,
     pub agent: bool,
     pub known_hosts: PathBuf,
+    pub known_hosts_explicit: bool,
 }
 
 async fn authenticate_agent(
@@ -159,19 +161,16 @@ struct HostKey {
 impl client::Handler for HostKey {
     type Error = anyhow::Error;
     async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool> {
-        let PublicKeyOrCertificate::PublicKey { key, .. } = key else {
-            bail!("SSH host certificates are unsupported");
-        };
-        ensure!(
-            keys::check_known_hosts_path(&self.host, self.port, key, &self.known_hosts)
-                .context("verify SSH host key")?,
-            "SSH host key is not trusted; add a verified key to the chosen known_hosts file"
-        );
+        crate::host_keys::verify(&self.known_hosts, &self.host, self.port, key)?;
         Ok(true)
     }
 }
 
+trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
+
 pub struct Wire {
+    _jumps: Vec<client::Handle<HostKey>>,
     _session: client::Handle<HostKey>,
     channel: Channel<client::Msg>,
     buffer: VecDeque<u8>,
@@ -186,61 +185,99 @@ impl Wire {
             !(auth.identity.is_some() && auth.agent),
             "--identity-file and --ssh-agent cannot be used together"
         );
-        // russh supports plain/hashed hostnames, but not OpenSSH marker semantics.
-        // Reject marker-bearing files rather than overlooking revoked/CA entries.
-        let known = std::fs::read_to_string(&auth.known_hosts).context("read known_hosts")?;
-        ensure!(known.len() <= 1024 * 1024, "known_hosts exceeds limit");
-        ensure!(
-            !known.lines().any(|l| l.trim_start().starts_with('@')),
-            "known_hosts markers (@revoked/@cert-authority) are unsupported; use a dedicated plain host-key file"
+        let mut route = crate::ssh_config::route(remote, auth)?
+            .into_iter()
+            .peekable();
+        let first = route.peek().context("missing SSH destination")?;
+        let mut stream: Box<dyn Stream> = Box::new(
+            tokio::net::TcpStream::connect((first.remote.host.as_str(), first.remote.port))
+                .await
+                .context("connect SSH")?,
         );
-        let handler = HostKey {
-            host: remote.host.clone(),
-            port: remote.port,
-            known_hosts: auth.known_hosts.clone(),
-        };
-        let config = client::Config {
-            inactivity_timeout: Some(Duration::from_secs(30)),
-            ..Default::default()
-        };
-        let mut session = client::connect(
-            Arc::new(config),
-            (remote.host.as_str(), remote.port),
-            handler,
-        )
-        .await
-        .context("connect SSH")?;
-        let hash_alg = session.best_supported_rsa_hash().await?.flatten();
-        let authenticated = if let Some(path) = &auth.identity {
-            let key = keys::load_secret_key(path, None)
-                .context("load SSH key (use --ssh-agent for encrypted keys)")?;
-            session
-                .authenticate_publickey(
-                    &remote.user,
-                    PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
-                )
-                .await?
-                .success()
-        } else if auth.agent {
-            authenticate_agent(&mut session, &remote.user, hash_alg).await?
-        } else {
-            authenticate_defaults(&mut session, &remote.user, hash_alg).await?
-        };
-        ensure!(
-            authenticated,
-            "SSH authentication failed; load an authorized key into the SSH agent or provide --identity-file with an unencrypted key"
-        );
-        let channel = session.channel_open_session().await?;
-        channel.exec(true, remote.command(receive)).await?;
-        Ok(Self {
-            _session: session,
-            channel,
-            buffer: VecDeque::new(),
-            received: 0,
-            diagnostics: Vec::new(),
-            exit: None,
-            closed: false,
-        })
+        let mut jumps = Vec::new();
+        while let Some(settings) = route.next() {
+            let remote = &settings.remote;
+            let certificates =
+                crate::host_keys::has_authority(&settings.known_hosts, &remote.host, remote.port)?;
+            let handler = HostKey {
+                host: remote.host.clone(),
+                port: remote.port,
+                known_hosts: settings.known_hosts,
+            };
+            let mut config = client::Config {
+                inactivity_timeout: Some(Duration::from_secs(30)),
+                ..Default::default()
+            };
+            if certificates {
+                config.preferred.host_key_certificates = config.preferred.key.clone();
+            }
+            let mut session = client::connect_stream(Arc::new(config), stream, handler)
+                .await
+                .context("connect SSH")?;
+            let password_var = if route.peek().is_some() {
+                "SAFE_GIT_SSH_JUMP_PASSWORD"
+            } else {
+                "SAFE_GIT_SSH_PASSWORD"
+            };
+            let password = std::env::var(password_var).ok();
+            let hash_alg = session.best_supported_rsa_hash().await?.flatten();
+            let authenticated = if let Some(password) = password {
+                ensure!(
+                    !password.is_empty()
+                        && password.len() <= 8192
+                        && !password.chars().any(char::is_control),
+                    "invalid SSH password"
+                );
+                session
+                    .authenticate_password(&remote.user, password)
+                    .await?
+                    .success()
+            } else if let Some(path) = &settings.identity {
+                let key = keys::load_secret_key(path, None)
+                    .context("load SSH key (use an agent for encrypted keys)")?;
+                session
+                    .authenticate_publickey(
+                        &remote.user,
+                        PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+                    )
+                    .await?
+                    .success()
+            } else if settings.agent {
+                authenticate_agent(&mut session, &remote.user, hash_alg).await?
+            } else {
+                authenticate_defaults(&mut session, &remote.user, hash_alg).await?
+            };
+            ensure!(
+                authenticated,
+                "SSH authentication failed; provide a host-selected key, agent or password"
+            );
+            if let Some(next) = route.peek() {
+                let channel = session
+                    .channel_open_direct_tcpip(
+                        &next.remote.host,
+                        u32::from(next.remote.port),
+                        "127.0.0.1",
+                        0,
+                    )
+                    .await?;
+                stream = Box::new(channel.into_stream());
+                jumps.push(session);
+            } else {
+                let channel = session.channel_open_session().await?;
+                channel.exec(true, remote.command(receive)).await?;
+                return Ok(Self {
+                    _jumps: jumps,
+                    _session: session,
+                    channel,
+                    buffer: VecDeque::new(),
+                    received: 0,
+                    diagnostics: Vec::new(),
+                    exit: None,
+                    closed: false,
+                });
+            }
+        }
+        bail!("missing SSH destination")
     }
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
         self.channel.data_bytes(data).await?;

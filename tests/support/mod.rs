@@ -1,4 +1,5 @@
 pub mod http;
+pub mod password;
 pub mod service;
 
 use std::{
@@ -295,6 +296,18 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
+        Self::options(false, false, "-1m:+1h")
+    }
+    pub fn forwarding() -> Self {
+        Self::options(true, false, "-1m:+1h")
+    }
+    pub fn certificate() -> Self {
+        Self::options(false, true, "-1m:+1h")
+    }
+    pub fn expired_certificate() -> Self {
+        Self::options(false, true, "-2h:-1h")
+    }
+    fn options(forwarding: bool, certificate: bool, validity: &str) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("safe-git-test-")
             .tempdir()
@@ -317,7 +330,11 @@ impl Fixture {
         );
         write(
             root.join("authorized_keys"),
-            format!("restrict {}", read(root.join("client_key.pub"))),
+            format!(
+                "{}{}",
+                if forwarding { "" } else { "restrict " },
+                read(root.join("client_key.pub"))
+            ),
         );
         let config = root.join("sshd_config");
         let root_text = root.display();
@@ -329,6 +346,41 @@ impl Fixture {
                 quote(root)
             ),
         );
+        if forwarding {
+            let text = read(&config).replace("DisableForwarding yes", "DisableForwarding no");
+            write(&config, text);
+        }
+        if certificate {
+            TestCommand::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(root.join("ca"))
+                .run();
+            TestCommand::new("ssh-keygen")
+                .args(["-q", "-s"])
+                .arg(root.join("ca"))
+                .args([
+                    "-I",
+                    "transport-fixture",
+                    "-h",
+                    "-n",
+                    "127.0.0.1",
+                    "-V",
+                    validity,
+                ])
+                .arg(root.join("host_key.pub"))
+                .run();
+            append(
+                &config,
+                &format!("HostCertificate {root_text}/host_key-cert.pub\n"),
+            );
+            write(
+                root.join("known_hosts"),
+                format!(
+                    "@cert-authority [127.0.0.1]:{port} {}",
+                    read(root.join("ca.pub"))
+                ),
+            );
+        }
         if privileged("/usr/bin/sshd")
             .args(["-T", "-f"])
             .arg(&config)

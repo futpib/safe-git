@@ -82,20 +82,20 @@ pub fn normalize_from(value: &str, directory: &std::path::Path) -> Result<String
         _ => Ok(value.to_owned()),
     }
 }
-fn client() -> Result<reqwest::Client> {
+pub(crate) fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(120))
         .user_agent(concat!("safe-git/", env!("CARGO_PKG_VERSION")))
         .build()?)
 }
-fn service_url(base: &url::Url, suffix: &str) -> Result<url::Url> {
+pub(crate) fn service_url(base: &url::Url, suffix: &str) -> Result<url::Url> {
     Ok(url::Url::parse(&format!(
         "{}/{suffix}",
         base.as_str().trim_end_matches('/')
     ))?)
 }
-async fn body(mut response: reqwest::Response, kind: &str, limit: usize) -> Result<Vec<u8>> {
+async fn body(response: reqwest::Response, kind: &str, limit: usize) -> Result<Vec<u8>> {
     ensure!(
         response.status().is_success(),
         "HTTP Git service returned {} (redirects and authentication prompts are not followed)",
@@ -108,6 +108,13 @@ async fn body(mut response: reqwest::Response, kind: &str, limit: usize) -> Resu
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.split(';').next() == Some(kind)),
         "unexpected HTTP Git content type"
+    );
+    read_body(response, limit).await
+}
+pub(crate) async fn read_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    ensure!(
+        response.status().is_success(),
+        "HTTP Git request failed (redirects are not followed)"
     );
     ensure!(
         response.content_length().is_none_or(|v| v <= limit as u64),
@@ -141,11 +148,31 @@ fn packet<'a>(bytes: &mut &'a [u8]) -> Result<Option<&'a [u8]>> {
     *bytes = &bytes[size..];
     Ok(Some(value))
 }
-async fn http_ad(client: &reqwest::Client, base: &url::Url) -> Result<Advertisement> {
+async fn http_ad(client: &reqwest::Client, base: &url::Url) -> Result<(Advertisement, bool)> {
     let mut url = service_url(base, "info/refs")?;
     url.set_query(Some("service=git-upload-pack"));
+    let response = http_auth(client.get(url), base)?.send().await?;
+    let smart = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';').next() == Some("application/x-git-upload-pack-advertisement")
+        });
+    if !smart {
+        ensure!(
+            response.status().is_success(),
+            "HTTP Git service returned {} (redirects and authentication prompts are not followed)",
+            response.status()
+        );
+        let bytes = read_body(response, 8 * 1024 * 1024).await?;
+        return Ok((
+            crate::static_http::advertisement(client, base, &bytes).await?,
+            false,
+        ));
+    }
     let data = body(
-        http_auth(client.get(url), base)?.send().await?,
+        response,
         "application/x-git-upload-pack-advertisement",
         8 * 1024 * 1024,
     )
@@ -164,7 +191,7 @@ async fn http_ad(client: &reqwest::Client, base: &url::Url) -> Result<Advertisem
         count += 1;
     }
     ensure!(bytes.is_empty(), "trailing HTTP advertisement data");
-    Ok(ad)
+    Ok((ad, true))
 }
 fn local_ad(repo: &Repo) -> Result<Advertisement> {
     let refs = repo.refs()?;
@@ -197,9 +224,9 @@ fn local_ad(repo: &Repo) -> Result<Advertisement> {
 pub async fn discover(url: &str, auth: &Auth) -> Result<Advertisement> {
     match endpoint(url)? {
         Endpoint::Ssh(remote) => protocol::discover(&remote, auth).await,
-        Endpoint::Http(base) => http_ad(&client()?, &base).await,
+        Endpoint::Http(base) => Ok(http_ad(&client()?, &base).await?.0),
         Endpoint::Git(base) => {
-            let (mut socket, ad) = native_ad(&base).await?;
+            let (mut socket, ad) = native_ad(&base, false).await?;
             use tokio::io::AsyncWriteExt;
             socket.write_all(b"0000").await?;
             socket.shutdown().await?;
@@ -278,12 +305,15 @@ pub async fn fetch_options(
         Endpoint::Ssh(remote) => protocol::fetch_options(&remote, auth, refs, haves, options).await,
         Endpoint::Http(base) => {
             let client = client()?;
-            let ad = http_ad(&client, &base).await?;
+            let (ad, smart) = http_ad(&client, &base).await?;
             for (name, id) in refs {
                 ensure!(
                     options.raw || ad.refs.get(name) == Some(id),
                     "remote ref changed while fetching; retry"
                 );
+            }
+            if !smart {
+                return crate::static_http::fetch(&client, &base, refs, options).await;
             }
             let tips: HashSet<_> = refs.values().copied().collect();
             let request = protocol::request_options(
@@ -323,7 +353,7 @@ pub async fn fetch_options(
         }
         Endpoint::Git(base) => {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let (mut socket, ad) = native_ad(&base).await?;
+            let (mut socket, ad) = native_ad(&base, false).await?;
             for (name, id) in refs {
                 ensure!(
                     options.raw || ad.refs.get(name) == Some(id),
@@ -429,7 +459,10 @@ pub async fn fetch_options(
     }
 }
 
-async fn native_ad(url: &url::Url) -> Result<(tokio::net::TcpStream, Advertisement)> {
+async fn native_ad(
+    url: &url::Url,
+    receive: bool,
+) -> Result<(tokio::net::TcpStream, Advertisement)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let host = url.host_str().context("missing Git host")?;
     let mut socket = tokio::net::TcpStream::connect((host, url.port().unwrap_or(9418))).await?;
@@ -438,9 +471,14 @@ async fn native_ad(url: &url::Url) -> Result<(tokio::net::TcpStream, Advertiseme
     } else {
         host.to_owned()
     };
+    let service = if receive {
+        "git-receive-pack"
+    } else {
+        "git-upload-pack"
+    };
     socket
         .write_all(&crate::transport::packet(
-            format!("git-upload-pack {}\0host={host_header}\0", url.path()).as_bytes(),
+            format!("{service} {}\0host={host_header}\0", url.path()).as_bytes(),
         )?)
         .await?;
     let mut ad = Advertisement::new();
@@ -475,6 +513,18 @@ async fn native_ad(url: &url::Url) -> Result<(tokio::net::TcpStream, Advertiseme
 /// A receive-pack session bound to a caller-selected endpoint and exact ref.
 pub enum Push {
     Ssh(protocol::Push),
+    Native {
+        socket: tokio::net::TcpStream,
+        name: String,
+        old: Option<Oid>,
+        advertisement: Advertisement,
+    },
+    Local {
+        repo: Repo,
+        name: String,
+        old: Option<Oid>,
+        advertisement: Advertisement,
+    },
     Http {
         client: reqwest::Client,
         base: url::Url,
@@ -483,8 +533,104 @@ pub enum Push {
         advertisement: Advertisement,
     },
 }
-fn http_auth(request: reqwest::RequestBuilder, base: &url::Url) -> Result<reqwest::RequestBuilder> {
-    if let Ok(token) = std::env::var("SAFE_GIT_HTTP_TOKEN") {
+fn checked_branch(repo: &Repo, mut head: Vec<u8>, name: &str) -> Result<bool> {
+    let mut seen = HashSet::new();
+    loop {
+        let value = head.strip_suffix(b"\n").unwrap_or(&head);
+        let Some(reference) = value.strip_prefix(b"ref: ") else {
+            Oid::parse(value)?;
+            return Ok(false);
+        };
+        let reference = std::str::from_utf8(reference)?;
+        crate::repo::refname(reference)?;
+        ensure!(
+            seen.len() < 8 && seen.insert(reference.to_owned()),
+            "cyclic or deep worktree HEAD"
+        );
+        if reference == name {
+            return Ok(true);
+        }
+        let Some(next) = repo.read(reference, 2048)? else {
+            return Ok(false);
+        };
+        head = next;
+    }
+}
+fn local_push_locks(repo: &Repo, name: &str) -> Result<Vec<crate::repo::Pending>> {
+    let mut locks = Vec::new();
+    if repo.worktree.is_some() {
+        locks.push(crate::repo::Pending::new(
+            repo.root.try_clone()?,
+            "HEAD.lock".into(),
+        )?);
+        ensure!(
+            !checked_branch(
+                repo,
+                repo.read("HEAD", 2048)?.context("missing HEAD")?,
+                name
+            )?,
+            "refusing to push to a checked-out branch"
+        );
+    }
+    // Read only metadata under the opened destination. In particular, never
+    // follow a linked worktree's gitdir path to discover its HEAD.
+    if repo.exists("worktrees")? {
+        let (dir, _) = repo.parent("worktrees/.check", false)?;
+        for entry in rustix::fs::Dir::read_from(&dir)? {
+            let entry = entry?;
+            let child = entry.file_name().to_str()?;
+            if matches!(child, "." | "..") {
+                continue;
+            }
+            ensure!(locks.len() < 1024, "too many destination worktrees");
+            let prefix = format!("worktrees/{child}");
+            let (metadata, _) = repo.parent(&format!("{prefix}/.check"), false)?;
+            locks.push(crate::repo::Pending::new(metadata, "HEAD.lock".into())?);
+            let head = repo
+                .read(&format!("{prefix}/HEAD"), 2048)?
+                .context("worktree has no HEAD")?;
+            ensure!(
+                !checked_branch(repo, head, name)?,
+                "refusing to push to a branch checked out in a linked worktree"
+            );
+        }
+    }
+    crate::linked::available(repo, name)?;
+    Ok(locks)
+}
+pub(crate) fn http_auth(
+    request: reqwest::RequestBuilder,
+    base: &url::Url,
+) -> Result<reqwest::RequestBuilder> {
+    let token = std::env::var("SAFE_GIT_HTTP_TOKEN").ok();
+    let username = std::env::var("SAFE_GIT_HTTP_USERNAME").ok();
+    let password = std::env::var("SAFE_GIT_HTTP_PASSWORD").ok();
+    ensure!(
+        token.is_none() || (username.is_none() && password.is_none()),
+        "select either HTTP Bearer or Basic authentication"
+    );
+    if username.is_some() || password.is_some() {
+        ensure!(base.scheme() == "https", "HTTP credentials require HTTPS");
+        let username =
+            username.context("HTTP Basic authentication requires SAFE_GIT_HTTP_USERNAME")?;
+        let password =
+            password.context("HTTP Basic authentication requires SAFE_GIT_HTTP_PASSWORD")?;
+        ensure!(
+            !username.is_empty()
+                && username.len() <= 1024
+                && !username.contains(':')
+                && !username.chars().any(char::is_control),
+            "invalid HTTP username"
+        );
+        ensure!(
+            !password.is_empty()
+                && password.len() <= 8192
+                && !password.chars().any(char::is_control),
+            "invalid HTTP password"
+        );
+        return Ok(request.basic_auth(username, Some(password)));
+    }
+    if let Some(token) = token {
         ensure!(base.scheme() == "https", "HTTP tokens require HTTPS");
         ensure!(
             !token.is_empty() && token.len() <= 8192 && !token.chars().any(char::is_control),
@@ -537,31 +683,103 @@ impl Push {
                     advertisement: ad,
                 })
             }
-            _ => anyhow::bail!("push requires SSH or HTTP(S)"),
+            Endpoint::Git(base) => {
+                let (socket, ad) = native_ad(&base, true).await?;
+                ensure!(
+                    ad.caps.contains("report-status"),
+                    "server lacks report-status"
+                );
+                Ok(Self::Native {
+                    socket,
+                    name: name.into(),
+                    old: ad.refs.get(name).copied(),
+                    advertisement: ad,
+                })
+            }
+            Endpoint::Local(path) => {
+                let repo = Repo::open(&path)?;
+                // Neither receive hooks nor receive.* configuration is executed or trusted.
+                // A checked-out branch must never be changed behind its working tree.
+                let _locks = local_push_locks(&repo, name)?;
+                ensure!(
+                    repo.shallow.is_empty(),
+                    "push to a shallow local repository is unsupported"
+                );
+                let old = repo.read_ref(name)?;
+                let mut advertisement = Advertisement::new();
+                if let Some(old) = old {
+                    advertisement.refs.insert(name.into(), old);
+                }
+                Ok(Self::Local {
+                    repo,
+                    name: name.into(),
+                    old,
+                    advertisement,
+                })
+            }
         }
     }
     pub fn old(&self) -> Option<Oid> {
         match self {
             Self::Ssh(p) => p.old,
             Self::Http { old, .. } => *old,
+            Self::Native { old, .. } | Self::Local { old, .. } => *old,
         }
     }
     pub async fn unchanged(self) -> Result<()> {
         match self {
             Self::Ssh(p) => p.unchanged().await,
             Self::Http { .. } => Ok(()),
+            Self::Local { .. } => Ok(()),
+            Self::Native { mut socket, .. } => {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                socket.write_all(b"0000").await?;
+                socket.shutdown().await?;
+                let mut rest = Vec::new();
+                socket.take(1025).read_to_end(&mut rest).await?;
+                ensure!(rest.is_empty(), "unexpected response to empty push");
+                Ok(())
+            }
         }
     }
     pub fn advertisement(&self) -> &Advertisement {
         match self {
             Self::Ssh(p) => &p.advertisement,
-            Self::Http { advertisement, .. } => advertisement,
+            Self::Http { advertisement, .. }
+            | Self::Native { advertisement, .. }
+            | Self::Local { advertisement, .. } => advertisement,
         }
     }
     pub async fn send(self, new: Oid, pack: Vec<u8>) -> Result<()> {
         match self {
             Self::Ssh(p) => p.send(new, pack).await,
-            Self::Http { ref name, old, .. } => {
+            Self::Local {
+                repo, name, old, ..
+            } => {
+                let _head_locks = local_push_locks(&repo, &name)?;
+                if new == Oid::ZERO {
+                    if let Some(old) = old {
+                        repo.delete_ref(&name, old)?;
+                    }
+                    return Ok(());
+                }
+                let objects = crate::pack::decode(&pack)?;
+                let mut store = Store::new(&repo);
+                store.allow_promisor = false;
+                store.add(objects)?;
+                if name.starts_with("refs/heads/") {
+                    store.get(new)?.commit()?;
+                }
+                // Validate all referenced objects before publishing the destination ref.
+                let ids = crate::object::reachable(&mut store, new)?;
+                crate::linked::available(&repo, &name)?;
+                let lock = repo.prepare_ref(&name, old)?;
+                for id in ids {
+                    repo.write_object(store.get(id)?.as_ref())?;
+                }
+                lock.commit(new)
+            }
+            Self::Http { ref name, old, .. } | Self::Native { ref name, old, .. } => {
                 let updates = vec![protocol::RefUpdate {
                     name: name.clone(),
                     old,
@@ -579,6 +797,36 @@ impl Push {
     ) -> Result<()> {
         match self {
             Self::Ssh(p) => p.send_many(updates, atomic, pack).await,
+            Self::Local { .. } => anyhow::bail!("local push does not support atomic updates"),
+            Self::Native {
+                mut socket,
+                advertisement,
+                ..
+            } => {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                socket
+                    .write_all(&protocol::push_request(&advertisement, updates, atomic)?)
+                    .await?;
+                socket.write_all(&pack).await?;
+                socket.shutdown().await?;
+                let mut data = Vec::new();
+                socket
+                    .take(8 * 1024 * 1024 + 1)
+                    .read_to_end(&mut data)
+                    .await?;
+                ensure!(data.len() <= 8 * 1024 * 1024, "push report exceeds limit");
+                let mut bytes = data.as_slice();
+                ensure!(
+                    packet(&mut bytes)? == Some(b"unpack ok\n".as_slice()),
+                    "remote unpack failed"
+                );
+                let mut remaining: HashSet<_> = updates.iter().map(|u| u.name.as_str()).collect();
+                while let Some(line) = packet(&mut bytes)? {
+                    protocol::push_status(line, &mut remaining)?;
+                }
+                ensure!(remaining.is_empty(), "missing ref status");
+                Ok(())
+            }
             Self::Http {
                 client,
                 base,

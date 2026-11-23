@@ -7,6 +7,7 @@ mod compat;
 mod config;
 mod files;
 mod history;
+mod host_keys;
 mod ignore;
 mod index;
 mod inspect;
@@ -30,7 +31,9 @@ mod search;
 mod sequence;
 mod shallow;
 mod sparse;
+mod ssh_config;
 mod stash;
+mod static_http;
 mod submodule;
 mod tags;
 mod transport;
@@ -224,6 +227,7 @@ impl Cli {
             identity: self.identity_file.clone(),
             agent: self.ssh_agent,
             known_hosts,
+            known_hosts_explicit: self.known_hosts.is_some(),
         })
     }
 }

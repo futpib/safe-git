@@ -567,7 +567,7 @@ fn validate_config(bytes: &[u8]) -> Result<bool> {
     Ok(bare == Some(true))
 }
 
-fn loose(bytes: &[u8]) -> Result<Object> {
+pub(crate) fn loose(bytes: &[u8]) -> Result<Object> {
     let mut decoder = ZlibDecoder::new(bytes);
     let mut decoded = Vec::new();
     (&mut decoder)

@@ -32,13 +32,27 @@ Fetch --depth/--deepen adjusts the boundary. Partial clones support
 `--filter=blob:none` and `blob:limit=N`, fetching missing blobs only from a
 host-registered promisor. Sparse checkout supports cone and non-cone patterns
 with ordinary indexes; compressed sparse indexes remain unsupported.
-Fetch supports SSH, HTTP(S), native git://, and local objects. Push supports
-SSH/HTTP(S), branches/tags, deletion, explicit force, and force-with-lease.
+Fetch supports SSH, smart or static HTTP(S), native git://, and local objects.
+Push supports SSH/HTTP(S), git://, local paths/file://, branches/tags, deletion,
+explicit force, and force-with-lease. Local pushes never run destination hooks
+and refuse checked-out branches. Static HTTP verifies loose/packed objects;
+alternates cannot redirect fetching, and shallow/filter negotiation needs smart Git.
 Push --all selects every local branch; --atomic requires server support and
-updates all requested refs together or none.
+updates all requested refs together or none. Local pushes do not support --atomic.
 Push --dry-run checks the destination without sending updates or saving upstreams.
-Caller-provided SAFE_GIT_HTTP_TOKEN is sent only over HTTPS. Redirects and
+HTTPS authentication accepts caller-provided SAFE_GIT_HTTP_TOKEN (Bearer) or
+SAFE_GIT_HTTP_USERNAME plus SAFE_GIT_HTTP_PASSWORD (Basic, including PATs).
+Credentials are never sent over plain HTTP. Redirects, URL credentials, and
 credential helpers are never followed.
+
+SSH uses keys, an agent, or caller-provided SAFE_GIT_SSH_PASSWORD.
+Host aliases, HostName/User/Port, IdentityFile/IdentitiesOnly, UserKnownHostsFile,
+and ProxyJump come only from ~/.ssh/config or caller-selected SAFE_GIT_SSH_CONFIG.
+Jump hosts use their own key settings or SAFE_GIT_SSH_JUMP_PASSWORD. Every hop
+requires a verified key or host certificate; known_hosts CA/revocation markers
+and hashed names are supported. Include/Match blocks are not evaluated, and
+ProxyCommand/LocalCommand/KnownHostsCommand cannot run. No password prompts or
+repository-selected SSH commands execute. FTP/FTPS and rsync are unsupported.
 
 Remote add/set-url/get-url/rename/remove/show/update and fetch --all use
 host-owned registrations. Clone and push -u remember endpoints/upstreams there.

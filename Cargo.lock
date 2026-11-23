@@ -2050,10 +2050,12 @@ name = "safe-git"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "diffy",
  "flate2",
  "hex",
+ "hmac",
  "libtest-mimic",
  "rcgen",
  "regex",
@@ -2063,6 +2065,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
  "sha1-checked",
  "shlex",
  "tempfile",

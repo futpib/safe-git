@@ -20,6 +20,8 @@ mod remaining;
 mod support;
 #[path = "suites/transfers.rs"]
 mod transfers;
+#[path = "suites/transport_gaps.rs"]
+mod transport_gaps;
 #[path = "suites/workflow.rs"]
 mod workflow;
 #[path = "suites/worktree.rs"]
@@ -57,6 +59,18 @@ fn main() {
             }),
             libtest_mimic::Trial::test("remaining_stashing", || {
                 remaining::stashing();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("transport_http", || {
+                transport_gaps::http();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("transport_local_native", || {
+                transport_gaps::local_native();
+                Ok(())
+            }),
+            libtest_mimic::Trial::test("transport_ssh", || {
+                transport_gaps::ssh();
                 Ok(())
             }),
             libtest_mimic::Trial::test("completion_inspection", || {

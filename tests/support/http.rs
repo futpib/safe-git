@@ -94,6 +94,20 @@ fn serve(mut stream: impl Read + Write, root: &PathBuf) {
     let first = lines.next().unwrap();
     let parts: Vec<_> = first.split(' ').collect();
     let (method, target) = (parts[0], parts[1]);
+    if let Ok(expected) = std::fs::read_to_string(root.join(".http-authorization")) {
+        let actual = lines
+            .clone()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.trim())
+            })
+            .unwrap_or("");
+        if actual != expected.trim() {
+            write!(stream, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            return;
+        }
+    }
     let length = lines
         .clone()
         .find_map(|l| {
@@ -115,6 +129,27 @@ fn serve(mut stream: impl Read + Write, root: &PathBuf) {
         return;
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if root.join(".static-http").exists() {
+        use std::fs::OpenOptions;
+        writeln!(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root.join(".http-requests"))
+                .unwrap(),
+            "{target}"
+        )
+        .unwrap();
+        assert!(!path.split('/').any(|p| p == ".."));
+        let data = std::fs::read(root.join(path.trim_start_matches('/')));
+        let (status, data) = match data {
+            Ok(data) => ("200 OK", data),
+            Err(_) => ("404 Not Found", Vec::new()),
+        };
+        write!(stream, "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", data.len()).unwrap();
+        let _ = stream.write_all(&data);
+        return;
+    }
     let mut child = Command::new("git")
         .arg("http-backend")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
