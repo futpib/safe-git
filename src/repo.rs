@@ -860,7 +860,9 @@ impl Store<'_> {
             .enumerate()
             .find_map(|(i, p)| p.ids.get(&oid).map(|o| (i, *o)))
             .ok_or(MissingObject(oid))?;
-        let entry = self.packs[pack].entry(offset)?;
+        let entry = self.packs[pack]
+            .entry(offset)
+            .with_context(|| format!("read packed object {oid}"))?;
         let object = match entry {
             PackedEntry::Object(object) => object,
             PackedEntry::Delta(base, delta) => {

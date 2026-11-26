@@ -1,13 +1,88 @@
 //! Explicit push intent over host-bound endpoints. Repository config cannot redirect it.
 use crate::{
     Cli, network,
-    object::{Kind, Oid, ReadObjects, ancestor, reachable},
+    object::{self, Kind, Oid, ReadObjects, ancestor},
     pack,
     repo::{Repo, Store},
     revision, trust,
 };
 use anyhow::{Context, Result, ensure};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+fn receiver_objects(
+    store: &mut impl ReadObjects,
+    advertisement: &crate::protocol::Advertisement,
+) -> Result<HashSet<Oid>> {
+    ensure!(
+        advertisement.refs.len() <= object::MAX_OBJECTS,
+        "too many remote refs"
+    );
+    let mut pending: Vec<_> = advertisement.refs.values().map(|id| (*id, None)).collect();
+    let mut known = HashSet::new();
+    let mut bytes = 0usize;
+    while let Some((id, expected)) = pending.pop() {
+        if !known.insert(id) {
+            continue;
+        }
+        ensure!(
+            known.len() <= object::MAX_OBJECTS,
+            "remote object count exceeds limit"
+        );
+        // A verified tree proves the receiver has its blobs. Reading their
+        // contents would defeat incremental pushes from partial/large repos.
+        if expected == Some(Kind::Blob) {
+            continue;
+        }
+        // Advertised objects may be absent or unreadable locally. They remain
+        // known, but only verified local metadata can prove their descendants.
+        let Ok(obj) = store.get(id) else {
+            continue;
+        };
+        ensure!(
+            expected.is_none_or(|kind| obj.kind == kind),
+            "object {id} has unexpected type"
+        );
+        bytes = bytes.checked_add(obj.data.len()).context("size overflow")?;
+        ensure!(
+            bytes <= object::MAX_TOTAL,
+            "remote metadata exceeds byte limit"
+        );
+        let mut children = obj.children_for(id.format())?;
+        if obj.kind == Kind::Commit && store.shallow(id) {
+            children.retain(|(_, kind)| *kind != Kind::Commit);
+        }
+        ensure!(
+            pending.len() + children.len() <= object::MAX_OBJECTS * 4,
+            "remote graph fanout exceeds limit"
+        );
+        pending.extend(children.into_iter().map(|(id, kind)| (id, Some(kind))));
+    }
+    Ok(known)
+}
+
+fn pack_for(
+    store: &mut Store<'_>,
+    tips: &[Oid],
+    advertisement: &crate::protocol::Advertisement,
+) -> Result<Vec<u8>> {
+    if tips.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Missing receiver metadata is only an optimization opportunity, never a
+    // reason to hydrate history from a promisor. Restore normal reads for new
+    // objects, which must still pass the existing integrity and size limits.
+    let allow = store.allow_promisor;
+    store.allow_promisor = false;
+    let known = receiver_objects(store, advertisement);
+    store.allow_promisor = allow;
+    let ids = object::reachable_many_since(store, tips, &known?)?;
+    let objects = ids
+        .into_iter()
+        .map(|id| store.get(id))
+        .collect::<Result<Vec<_>>>()?;
+    pack::encode_for(&objects, store.format())
+}
+
 pub struct Options<'a> {
     pub all: bool,
     pub atomic: bool,
@@ -214,22 +289,17 @@ pub async fn run(
             })
             .collect();
         if !updates.is_empty() {
-            let mut ids = BTreeSet::new();
-            for update in &updates {
-                if !update.new.is_zero() {
-                    ids.extend(reachable(store, update.new)?);
-                }
-            }
-            let objects = ids
-                .into_iter()
-                .map(|id| store.get(id))
-                .collect::<Result<Vec<_>>>()?;
-            let pack = if updates.iter().all(|u| u.new.is_zero()) {
-                Vec::new()
-            } else {
-                pack::encode_for(&objects, repo.format)?
-            };
             let push = network::Push::prepare(&endpoint, &auth, &updates[0].name).await?;
+            ensure!(
+                push.advertisement().format() == repo.format,
+                "push object format mismatch"
+            );
+            let tips: Vec<_> = updates
+                .iter()
+                .map(|u| u.new)
+                .filter(|id| !id.is_zero())
+                .collect();
+            let pack = pack_for(store, &tips, push.advertisement())?;
             push.send_many(&updates, true, pack).await?;
         }
     }
@@ -246,19 +316,6 @@ pub async fn run(
             continue;
         }
         if !options.atomic && old != Some(tip) && !(old.is_none() && tip.is_zero()) {
-            let objects = if tip.is_zero() {
-                Vec::new()
-            } else {
-                reachable(store, tip)?
-                    .into_iter()
-                    .map(|id| store.get(id))
-                    .collect::<Result<Vec<_>>>()?
-            };
-            let pack = if tip.is_zero() {
-                Vec::new()
-            } else {
-                pack::encode_for(&objects, repo.format)?
-            };
             let push = network::Push::prepare(&endpoint, &auth, &dest).await?;
             ensure!(
                 push.advertisement().format() == repo.format,
@@ -268,6 +325,12 @@ pub async fn run(
                 push.old() == old,
                 "push rejected: destination changed while preparing transfer; retry"
             );
+            let tips = if tip.is_zero() {
+                &[][..]
+            } else {
+                std::slice::from_ref(&tip)
+            };
+            let pack = pack_for(store, tips, push.advertisement())?;
             push.send(tip, pack).await?;
         }
         if options.upstream {

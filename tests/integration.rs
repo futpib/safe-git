@@ -18,6 +18,8 @@ mod http_packages;
 mod output;
 #[path = "suites/packages.rs"]
 mod packages;
+#[path = "suites/push_incremental.rs"]
+mod push_incremental;
 #[path = "suites/remaining.rs"]
 mod remaining;
 #[path = "support/mod.rs"]
@@ -45,6 +47,10 @@ fn main() {
     libtest_mimic::run(
         &args,
         vec![
+            libtest_mimic::Trial::test("push_incremental", || {
+                push_incremental::suite();
+                Ok(())
+            }),
             libtest_mimic::Trial::test("final_gaps_topology_recovery", || {
                 final_gaps::topology_recovery();
                 Ok(())

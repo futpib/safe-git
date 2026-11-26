@@ -346,11 +346,13 @@ pub fn reachable_many_since(
     let mut seen = HashSet::new();
     let mut pending = Vec::new();
     for tip in tips.iter().copied().collect::<HashSet<_>>() {
-        pending.push((tip, store.get(tip)?.kind));
+        if !boundary.contains(&tip) {
+            pending.push((tip, store.get(tip)?.kind));
+        }
     }
     let mut bytes = 0usize;
     while let Some((oid, expected)) = pending.pop() {
-        if expected == Kind::Commit && boundary.contains(&oid) {
+        if boundary.contains(&oid) {
             continue;
         }
         let obj = store.get(oid)?;

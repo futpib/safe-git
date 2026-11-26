@@ -49,6 +49,9 @@ alternates cannot redirect fetching, and shallow/filter negotiation needs smart 
 Empty static repositories must publish their config to identify the object format.
 Push --all selects every local branch; --atomic requires server support and
 updates all requested refs together or none. Local pushes do not support --atomic.
+Network pushes omit objects reachable from the receiver's advertised refs,
+using available local metadata without loading receiver-owned blobs or fetching
+missing history. Newly sent objects still obey the integrity and size limits.
 Push --dry-run checks the destination without sending updates or saving upstreams.
 HTTPS authentication accepts caller-provided SAFE_GIT_HTTP_TOKEN (Bearer) or
 SAFE_GIT_HTTP_USERNAME plus SAFE_GIT_HTTP_PASSWORD (Basic, including PATs).
