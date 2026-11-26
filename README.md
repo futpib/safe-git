@@ -35,6 +35,11 @@ Run `safe-git --help` for options, repository initialization, and checkout
 recovery. See [Git compatibility](COMPATIBILITY.md) for supported workflows
 and deliberate restrictions.
 
+Run the tests with `cargo test --locked`. The SSH integration tests require
+OpenSSH (`sshd`, `ssh-keygen`, `ssh-agent`, and `ssh-add`) and Git. They start a
+temporary loopback SSH server as the current user with generated test keys;
+root access and `sudo` are not required.
+
 Experimental and unaudited. Preventing repository-directed execution is the
 design, not a guarantee against implementation or dependency bugs. There is no
 OS sandbox, and pushes can still trigger hooks or CI on the remote server.

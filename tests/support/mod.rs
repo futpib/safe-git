@@ -177,14 +177,14 @@ impl TestCommand {
 
 pub struct ChildGuard {
     pub child: Child,
-    privileged_group: bool,
+    process_group: bool,
 }
 
 impl ChildGuard {
     fn new(child: Child) -> Self {
         Self {
             child,
-            privileged_group: false,
+            process_group: false,
         }
     }
     pub fn signal(&self, signal: rustix::process::Signal) {
@@ -195,27 +195,15 @@ impl ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if self.privileged_group {
-            // sudo and sshd share a new process group. Stop both even on panic.
-            let _ = privileged("kill")
-                .args(["-TERM", "--"])
-                .arg(format!("-{}", self.child.id()))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        if self.process_group {
+            // Stop the fixture's process group even when a test panics.
+            let _ = rustix::process::kill_process_group(
+                rustix::process::Pid::from_child(&self.child),
+                rustix::process::Signal::TERM,
+            );
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-fn privileged(program: &str) -> Command {
-    if rustix::process::getuid().is_root() {
-        Command::new(program)
-    } else {
-        let mut command = Command::new("sudo");
-        command.args(["-n", program]);
-        command
     }
 }
 
@@ -381,7 +369,7 @@ impl Fixture {
                 ),
             );
         }
-        if privileged("/usr/bin/sshd")
+        if Command::new("/usr/bin/sshd")
             .args(["-T", "-f"])
             .arg(&config)
             .args(["-o", "PerSourcePenalties=no"])
@@ -396,7 +384,9 @@ impl Fixture {
         let log_path = root.join("sshd.log");
         let log = File::create(&log_path).unwrap();
         drop(listener);
-        let child = privileged("/usr/bin/sshd")
+        // The server uses the current user, temporary keys and an unprivileged
+        // loopback port, so it does not need root or sudo.
+        let child = Command::new("/usr/bin/sshd")
             .args(["-D", "-e", "-f"])
             .arg(&config)
             .stdin(Stdio::null())
@@ -404,10 +394,10 @@ impl Fixture {
             .stderr(log)
             .process_group(0)
             .spawn()
-            .expect("start sshd (requires root or passwordless sudo)");
+            .expect("start test sshd as the current user");
         let mut server = ChildGuard {
             child,
-            privileged_group: true,
+            process_group: true,
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
